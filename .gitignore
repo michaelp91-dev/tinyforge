@@ -1,0 +1,9 @@
+build/
+runs/
+data/
+*.o
+*.tok
+*.bin
+*.idx
+*.parquet
+*.log
