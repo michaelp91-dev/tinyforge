@@ -13,7 +13,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Python deps
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu numpy tokenizers transformers
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy tokenizers transformers
       - name: CPU reference gradient checks
         run: make test
       - name: Export and tokenizer smoke
