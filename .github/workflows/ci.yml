@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python deps
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu numpy tokenizers transformers
+      - name: CPU reference gradient checks
+        run: make test
+      - name: Export and tokenizer smoke
+        run: python3 tests/test_export.py
+      - name: Stock llm.c CPU trainer
+        run: make cpu
+
+  cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CUDA toolkit
+        run: sudo apt-get update && sudo apt-get install -y nvidia-cuda-toolkit
+      - name: TinyForge trainer (nvcc)
+        run: make train_tinyforge
+      - name: Stock llm.c CUDA trainer (nvcc, sm_80 + PTX)
+        run: make -C third_party/llm.c train_gpt2cu
