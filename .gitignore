@@ -1,0 +1,12 @@
+train_tinyforge
+libtf_ref.so
+__pycache__/
+*.pyc
+data/
+*.bin
+third_party/llm.c/train_gpt2
+third_party/llm.c/train_gpt2cu
+third_party/llm.c/train_gpt2fp32cu
+third_party/llm.c/test_gpt2
+third_party/llm.c/test_gpt2cu
+third_party/llm.c/build/
