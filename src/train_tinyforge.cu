@@ -193,6 +193,7 @@ struct Model {
     float *embed_rstd, *q_rstd, *k_rstd, *losses;
     float *emb_g32, *wpe_g32;
     int *d_tokens, *d_targets;
+    float2* rope_cs; // (T, HS/2) cos/sin table for the fused path
     float *ns_x, *ns_xt, *ns_a, *ns_aa, *ns_b, *ns_y, *ns_partial;
     size_t ns_partial_n;
     size_t BT, BTC, BT3C, BT4C, att_one;
@@ -219,6 +220,11 @@ static void rms_forward(floatX* out, float* rstd, const floatX* x, int n, int C)
     ck(cudaGetLastError(), "rmsnorm forward");
 }
 static int g_fused_loss = 1;
+static int g_fuse = 1; // --fuse: fused residual+RMSNorm, stored ReLU^2, RoPE table, vectorized elementwise
+static int use_fused(const Model* m) {
+    const Config& c = m->cfg;
+    return g_fuse && c.rmsnorm && c.relu2 && !c.bias && c.C % 8 == 0 && (c.HS % 2) == 0;
+}
 static void loss_launch(float* losses, floatX* logits, const int* targets, int n, int V, int Vp,
                         float dloss, float softcap, int write_grad) {
     if (g_fused_loss && V % x128::size == 0 && Vp % x128::size == 0) {
@@ -245,7 +251,10 @@ static void norm_backward(Model* m, floatX* dx, floatX* dw, floatX* db,
     // Writes dx = norm_grad [+ skip if skip_or_null is non-NULL and we are in the += layernorm path].
     int B = m->cfg.B, T = m->cfg.T, C = m->cfg.C;
     int n = B * T;
-    if (m->cfg.rmsnorm) {
+    if (m->cfg.rmsnorm && use_fused(m)) {
+        tf_rmsnorm_backward_skip_kernel<<<n, 96>>>(dx, dout, x, rstd, skip_or_null, n, C);
+        ck(cudaGetLastError(), "rms bwd skip");
+    } else if (m->cfg.rmsnorm) {
         rms_backward(dx, dout, x, rstd, n, C);
         if (skip_or_null) {
             // dx = dx + skip, in place via a temporary add into dx
@@ -273,11 +282,18 @@ static void qk_forward(Model* m, floatX* qkv, float* q_rstd, float* k_rstd) {
                                                m->cfg.rope_base, m->cfg.rope, m->cfg.qknorm, m->cfg.qk_scale);
     ck(cudaGetLastError(), "qk forward");
 }
+static int use_fused(const Model* m);
 static void qk_backward(Model* m, floatX* dqkv, const floatX* q_post, const floatX* k_post,
                         const float* q_rstd, const float* k_rstd) {
     if (!m->cfg.rope && !m->cfg.qknorm) return;
     int B = m->cfg.B, T = m->cfg.T, NH = m->cfg.NH, HS = m->cfg.HS, C = m->cfg.C;
     int smem = (HS + 32) * (int)sizeof(float);
+    if (use_fused(m)) {
+        tf_qk_backward_tab_kernel<<<B * T * NH, HS, smem>>>(dqkv, q_post, k_post, q_rstd, k_rstd, m->rope_cs,
+                                                           B, T, NH, HS, C, m->cfg.rope, m->cfg.qknorm, m->cfg.qk_scale);
+        ck(cudaGetLastError(), "qk backward tab");
+        return;
+    }
     tf_qk_backward_kernel<<<B * T * NH, HS, smem>>>(dqkv, q_post, k_post, q_rstd, k_rstd,
                                                     B, T, NH, HS, C, m->cfg.rope_base,
                                                     m->cfg.rope, m->cfg.qknorm, m->cfg.qk_scale);
@@ -312,7 +328,21 @@ static void alloc_acts(Model* m) {
     m->logits = (floatX*)cualloc(BT * c.Vp * sizeof(floatX));
     m->qkvr = (floatX*)cualloc(L * 3 * BTC * sizeof(floatX));
     m->att = (floatX*)cualloc(L * m->att_one * sizeof(floatX));
-    m->hid = (floatX*)cualloc(BT4 * sizeof(floatX));
+    // L slices: the fused path keeps every layer's ReLU^2 output for the
+    // backward pass instead of recomputing it (unfused path uses slice 0).
+    m->hid = (floatX*)cualloc(L * BT4 * sizeof(floatX));
+    {
+        int half = c.HS / 2;
+        float2* h = (float2*)malloc((size_t)c.T * half * sizeof(float2));
+        for (int t = 0; t < c.T; t++)
+            for (int j = 0; j < half; j++) {
+                double f = (double)t / pow((double)c.rope_base, (2.0 * j) / (double)c.HS);
+                h[(size_t)t * half + j] = make_float2((float)cos(f), (float)sin(f));
+            }
+        m->rope_cs = (float2*)cualloc((size_t)c.T * half * sizeof(float2));
+        ck(cudaMemcpy(m->rope_cs, h, (size_t)c.T * half * sizeof(float2), cudaMemcpyHostToDevice), "rope table");
+        free(h);
+    }
     m->dhid = (floatX*)cualloc(BT4 * sizeof(floatX));
     m->dx = (floatX*)cualloc(BTC * sizeof(floatX));
     m->dres = (floatX*)cualloc(BTC * sizeof(floatX));
@@ -350,7 +380,75 @@ static void alloc_acts(Model* m) {
            (int)((L * m->att_one * sizeof(floatX)) >> 20));
 }
 
+static void tf_forward_fused(Model* m) {
+    Config c = m->cfg;
+    int B = c.B, T = c.T, C = c.C, L = c.L;
+    int BT = B * T;
+    PTensor* W = m->tensors;
+    tf_embed_forward_kernel<<<divup(BT * C, 256), 256>>>(
+        m->embed, m->d_tokens, W[m->id_wte].data, m->cfg.rope ? nullptr : W[m->id_wpe].data,
+        B, T, C, m->cfg.rope ? 0 : 1);
+    ck(cudaGetLastError(), "embed");
+    // layer l reads its input from block_in[l] (no copy); the last layer writes m->x.
+    if (c.embed_norm) rms_forward(m->block_in, m->embed_rstd, m->embed, BT, C);
+    else ck(cudaMemcpyAsync(m->block_in, m->embed, m->BTC * sizeof(floatX), cudaMemcpyDeviceToDevice), "copy x");
+    rms_forward(m->ln1, m->ln1_rstd, m->block_in, BT, C);
+    prof_mark("embed");
+    int smem = (c.HS + 32) * (int)sizeof(float);
+    for (int l = 0; l < L; l++) {
+        floatX* cur = m->block_in + (size_t)l * m->BTC;
+        floatX* l_ln1 = m->ln1 + (size_t)l * m->BTC;
+        matmul_forward_cublaslt(m->qkv, l_ln1, W[m->id_qkv[l]].data, nullptr, B, T, C, 3 * C, 0, nullptr, 0);
+        prof_mark("f_gemm");
+        if (c.rope || c.qknorm) {
+            tf_qk_forward_tab_kernel<<<BT * c.NH, c.HS, smem>>>(m->qkv, m->q_rstd + (size_t)l * BT * c.NH,
+                m->k_rstd + (size_t)l * BT * c.NH, m->rope_cs, B, T, c.NH, c.HS, C, c.rope, c.qknorm, c.qk_scale);
+            ck(cudaGetLastError(), "qk fwd");
+        }
+        prof_mark("f_rope_qknorm");
+        floatX* l_qkvr = m->qkvr + (size_t)l * 3 * m->BTC;
+        floatX* l_att = m->att + (size_t)l * m->att_one;
+        floatX* l_atty = m->atty + (size_t)l * m->BTC;
+        attention_forward(l_atty, l_qkvr, l_att, m->qkv, B, T, C, c.NH, 0);
+        prof_mark("f_attention");
+        floatX* proj = m->dx;
+        matmul_forward_cublaslt(proj, l_atty, W[m->id_att[l]].data, nullptr, B, T, C, C, 0, nullptr, 0);
+        prof_mark("f_gemm");
+        floatX* l_r2 = m->resid2 + (size_t)l * m->BTC;
+        floatX* l_ln2 = m->ln2 + (size_t)l * m->BTC;
+        tf_add_rmsnorm_kernel<<<BT, 96>>>(l_r2, l_ln2, m->ln2_rstd + (size_t)l * BT, cur, proj, BT, C, 1e-6f);
+        ck(cudaGetLastError(), "add+rms 2");
+        prof_mark("f_norm/copy");
+        floatX* pre = m->preact + (size_t)l * m->BT4C;
+        floatX* hid = m->hid + (size_t)l * m->BT4C;
+        matmul_forward_cublaslt(pre, l_ln2, W[m->id_fc[l]].data, nullptr, B, T, C, 4 * C, 0, nullptr, 0);
+        prof_mark("f_gemm");
+        tf_relu2_forward_vec_kernel<<<(unsigned)((m->BT4C / 8 + 255) / 256), 256>>>(hid, pre, m->BT4C);
+        ck(cudaGetLastError(), "relu2");
+        prof_mark("f_relu2");
+        matmul_forward_cublaslt(proj, hid, W[m->id_fp[l]].data, nullptr, B, T, 4 * C, C, 0, nullptr, 0);
+        prof_mark("f_gemm");
+        int last = (l + 1 == L);
+        floatX* nxt = last ? m->x : m->block_in + (size_t)(l + 1) * m->BTC;
+        floatX* nln = last ? m->lnf : m->ln1 + (size_t)(l + 1) * m->BTC;
+        float* nrs = last ? m->lnf_rstd : m->ln1_rstd + (size_t)(l + 1) * BT;
+        tf_add_rmsnorm_kernel<<<BT, 96>>>(nxt, nln, nrs, l_r2, proj, BT, C, 1e-6f);
+        ck(cudaGetLastError(), "add+rms 1");
+        prof_mark("f_norm/copy");
+    }
+    floatX* head = c.untie ? W[m->id_head].data : W[m->id_wte].data;
+    matmul_forward_cublaslt(m->logits, m->lnf, head, nullptr, B, T, C, c.Vp, 0, nullptr, 0);
+    ck(cudaGetLastError(), "logits");
+    prof_mark("f_head");
+}
+
+static void tf_forward_unfused(Model* m);
 static void tf_forward(Model* m) {
+    if (use_fused(m)) tf_forward_fused(m);
+    else tf_forward_unfused(m);
+}
+
+static void tf_forward_unfused(Model* m) {
     Config c = m->cfg;
     int B = c.B, T = c.T, C = c.C, L = c.L;
     int BT = B * T;
@@ -440,14 +538,18 @@ static float tf_backward(Model* m, float dloss) {
     for (int l = L - 1; l >= 0; l--) {
         floatX* l_r2 = m->resid2 + (size_t)l * m->BTC;
         floatX* pre = m->preact + (size_t)l * m->BT4C;
-        if (c.relu2) tf_relu2_forward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->hid, pre, (int)m->BT4C);
+        const int fused = use_fused(m);
+        floatX* hid = fused ? m->hid + (size_t)l * m->BT4C : m->hid;
+        if (fused) {}
+        else if (c.relu2) tf_relu2_forward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->hid, pre, (int)m->BT4C);
         else gelu_forward(m->hid, pre, (int)m->BT4C, 0);
         prof_mark("b_relu2");
         floatX* fpb_g = m->id_fpb[l] >= 0 ? W[m->id_fpb[l]].grad : nullptr;
-        matmul_backward(m->dhid, W[m->id_fp[l]].grad, fpb_g, dstream, m->hid, W[m->id_fp[l]].data,
+        matmul_backward(m->dhid, W[m->id_fp[l]].grad, fpb_g, dstream, hid, W[m->id_fp[l]].data,
                         nullptr, B, T, 4 * C, C, 0, nullptr, 0);
         prof_mark("b_gemm");
-        if (c.relu2) tf_relu2_backward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->dhid, m->dhid, pre, (int)m->BT4C);
+        if (fused) tf_relu2_backward_vec_kernel<<<(unsigned)((m->BT4C / 8 + 255) / 256), 256>>>(m->dhid, m->dhid, pre, m->BT4C);
+        else if (c.relu2) tf_relu2_backward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->dhid, m->dhid, pre, (int)m->BT4C);
         else gelu_backward_inplace(m->dhid, pre, (int)m->BT4C, 0);
         ck(cudaGetLastError(), "act bwd");
         prof_mark("b_relu2");
@@ -1039,6 +1141,7 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--profile") == 0) prof_steps = arg_int(v);
         else if (strcmp(a, "--ns-fp16") == 0) g_ns_fast16 = arg_int(v);
         else if (strcmp(a, "--fused-loss") == 0) g_fused_loss = arg_int(v);
+        else if (strcmp(a, "--fuse") == 0) g_fuse = arg_int(v);
         else if (strcmp(a, "--keep-ckpts") == 0) keep_ckpts = arg_int(v);
         else if (strcmp(a, "--nproc") == 0) g_world = arg_int(v);
         else if (strcmp(a, "--rank") == 0) g_rank = arg_int(v);
