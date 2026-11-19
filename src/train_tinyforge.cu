@@ -686,6 +686,72 @@ static void adam_update(PTensor* t, float lr, float b1, float b2, float eps, flo
     ck(cudaGetLastError(), "adamw");
 }
 
+// Muon for all matrices of one shape at once: strided-batched Newton-Schulz GEMMs
+// (one launch per GEMM per iteration instead of one per matrix) and no host syncs.
+// Same math as muon_ns_and_scale + tf_muon_apply_kernel.
+static int g_ns_batch = 1;
+static void sgemm_batched(cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                          const float* A, int lda, long long sA, const float* B, int ldb, long long sB,
+                          float* C, int ldc, long long sC, int nb) {
+    const float alpha = 1.f, beta = 0.f;
+    cublasCheck(cublasGemmStridedBatchedEx(g_cublas, ta, tb, m, n, k, &alpha,
+        A, CUDA_R_32F, lda, sA, B, CUDA_R_32F, ldb, sB, &beta, C, CUDA_R_32F, ldc, sC, nb,
+        g_ns_fast16 ? CUBLAS_COMPUTE_32F_FAST_16F : CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+static void muon_group(Model* m, int* ids, int nb, float lr, float wd, float momentum) {
+    static float *X = nullptr, *Y = nullptr, *A = nullptr, *AA = nullptr, *Bm = nullptr, *ss = nullptr;
+    static size_t capXY = 0, capA = 0;
+    PTensor* t0 = &m->tensors[ids[0]];
+    int rows = t0->rows, cols = t0->cols;
+    int trans = rows > cols;
+    int rm = trans ? cols : rows, rn = trans ? rows : cols;
+    size_t per = (size_t)rm * rn, perA = (size_t)rm * rm;
+    if (per * nb > capXY) {
+        if (X) { cudaFree(X); cudaFree(Y); }
+        capXY = per * nb;
+        X = (float*)cualloc(capXY * sizeof(float)); Y = (float*)cualloc(capXY * sizeof(float));
+    }
+    if (perA * nb > capA) {
+        if (A) { cudaFree(A); cudaFree(AA); cudaFree(Bm); }
+        capA = perA * nb;
+        A = (float*)cualloc(capA * sizeof(float)); AA = (float*)cualloc(capA * sizeof(float));
+        Bm = (float*)cualloc(capA * sizeof(float));
+    }
+    if (!ss) ss = (float*)cualloc(MAX_TENSORS * sizeof(float));
+    dim3 block(16, 16);
+    for (int b = 0; b < nb; b++) {
+        PTensor* t = &m->tensors[ids[b]];
+        float* dst = trans ? Y + b * per : X + b * per;
+        tf_muon_nesterov_kernel<<<divup((int)t->n, 256), 256>>>(dst, t->m, t->grad, t->n, momentum, g_grad_unscale);
+        if (trans) tf_transpose_kernel<<<dim3(divup(cols, 16), divup(rows, 16)), block>>>(X + b * per, dst, rows, cols);
+    }
+    ck(cudaMemsetAsync(ss, 0, nb * sizeof(float)), "ns ss");
+    tf_batched_sumsq_kernel<<<dim3(64, nb), 256>>>(ss, X, per);
+    tf_batched_normalize_kernel<<<dim3(64, nb), 256>>>(X, ss, per);
+    const float a = 3.4445f, bcoef = -4.7750f, c = 2.0315f;
+    for (int it = 0; it < 5; it++) {
+        // A = X X^T (row-major rm x rn X is a column-major rn x rm matrix Xc; A = Xc^T Xc)
+        sgemm_batched(CUBLAS_OP_T, CUBLAS_OP_N, rm, rm, rn, X, rn, per, X, rn, per, A, rm, perA, nb);
+        // AA = A A (symmetric)
+        sgemm_batched(CUBLAS_OP_N, CUBLAS_OP_N, rm, rm, rm, A, rm, perA, A, rm, perA, AA, rm, perA, nb);
+        tf_combo_kernel<<<divup((int)(perA * nb), 256), 256>>>(Bm, A, AA, (int)(perA * nb), bcoef, c);
+        // Y = B X (row-major), via column-major Y^T = X^T B^T
+        sgemm_batched(CUBLAS_OP_N, CUBLAS_OP_N, rn, rm, rm, X, rn, per, Bm, rm, perA, Y, rn, per, nb);
+        tf_axpy_kernel<<<divup((int)(per * nb), 256), 256>>>(X, Y, per * nb, a, 1.f);
+    }
+    float aspect = sqrtf(fmaxf(1.f, (float)rows / (float)cols));
+    for (int b = 0; b < nb; b++) {
+        PTensor* t = &m->tensors[ids[b]];
+        const float* upd = X + b * per;
+        if (trans) {
+            tf_transpose_kernel<<<dim3(divup(rm, 16), divup(rn, 16)), block>>>(Y + b * per, X + b * per, rm, rn);
+            upd = Y + b * per;
+        }
+        tf_muon_apply_scaled_kernel<<<divup((int)t->n, 256), 256>>>(t->master, t->data, upd, t->n, lr, wd, aspect);
+    }
+    ck(cudaGetLastError(), "muon group");
+}
+
 static void optimizer_step(Model* m, int step, float mult, float batch_scale, float dmodel_scale,
                            float matrix_lr, float embed_lr, float unembed_lr,
                            float muon_wd, float embed_wd, float head_wd, float vec_wd,
@@ -713,6 +779,8 @@ static void optimizer_step(Model* m, int step, float mult, float batch_scale, fl
                 b1 = 0.8f; b2 = 0.95f; eps = 1e-10f; wd = vec_wd;
             }
             adam_update(t, lr, b1, b2, eps, wd, step);
+        } else if (g_ns_batch) {
+            continue; // batched below
         } else {
             float lr = matrix_lr * batch_scale * mult;
             tf_muon_nesterov_kernel<<<divup((int)std::min(t->n, (size_t)1 << 30), 256), 256>>>(
@@ -722,6 +790,24 @@ static void optimizer_step(Model* m, int step, float mult, float batch_scale, fl
             tf_muon_apply_kernel<<<divup((int)std::min(t->n, (size_t)1 << 30), 256), 256>>>(
                 t->master, t->data, m->ns_y, t->n, lr, muon_wd);
             ck(cudaGetLastError(), "muon apply");
+        }
+    }
+    if (g_ns_batch) {
+        // group Muon tensors by shape, in registration order
+        int done[MAX_TENSORS] = {0};
+        int ids[MAX_TENSORS];
+        float lr = matrix_lr * batch_scale * mult;
+        for (int i = 0; i < m->ntensors; i++) {
+            PTensor* t = &m->tensors[i];
+            if (t->kind != KIND_MUON || t->n == 0 || done[i]) continue;
+            int nb = 0;
+            for (int j = i; j < m->ntensors; j++) {
+                PTensor* u = &m->tensors[j];
+                if (!done[j] && u->kind == KIND_MUON && u->rows == t->rows && u->cols == t->cols) {
+                    ids[nb++] = j; done[j] = 1;
+                }
+            }
+            muon_group(m, ids, nb, lr, muon_wd, momentum);
         }
     }
     ck(cudaDeviceSynchronize(), "optim sync");
@@ -1142,6 +1228,7 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--ns-fp16") == 0) g_ns_fast16 = arg_int(v);
         else if (strcmp(a, "--fused-loss") == 0) g_fused_loss = arg_int(v);
         else if (strcmp(a, "--fuse") == 0) g_fuse = arg_int(v);
+        else if (strcmp(a, "--ns-batch") == 0) g_ns_batch = arg_int(v);
         else if (strcmp(a, "--keep-ckpts") == 0) keep_ckpts = arg_int(v);
         else if (strcmp(a, "--nproc") == 0) g_world = arg_int(v);
         else if (strcmp(a, "--rank") == 0) g_rank = arg_int(v);

@@ -596,3 +596,32 @@ __global__ void tf_qk_backward_tab_kernel(floatX* dqkv, const floatX* q_post, co
     }
 }
 
+// ---- batched Muon helpers ----
+// sumsq[b] += sum of squares of matrix b (each matrix has `per` elements). grid (blocks_per, nb).
+__global__ void tf_batched_sumsq_kernel(float* sumsq, const float* x, size_t per) {
+    const float* xb = x + (size_t)blockIdx.y * per;
+    float ss = 0.f;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < per; i += (size_t)gridDim.x * blockDim.x) {
+        float v = xb[i];
+        ss += v * v;
+    }
+    __shared__ float smem[32];
+    ss = tf_block_sum(ss, smem);
+    if (threadIdx.x == 0) atomicAdd(sumsq + blockIdx.y, ss);
+}
+// x[b] *= 1 / (sqrt(sumsq[b]) + 1e-7)
+__global__ void tf_batched_normalize_kernel(float* x, const float* sumsq, size_t per) {
+    float s = 1.f / (sqrtf(sumsq[blockIdx.y]) + 1e-7f);
+    float* xb = x + (size_t)blockIdx.y * per;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < per; i += (size_t)gridDim.x * blockDim.x)
+        xb[i] *= s;
+}
+// master = master * (1 - lr * wd) - lr * uscale * update; param = (floatX)master
+__global__ void tf_muon_apply_scaled_kernel(float* master, floatX* param, const float* update,
+                                            size_t n, float lr, float wd, float uscale) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float p = master[i] * (1.f - lr * wd) - lr * uscale * update[i];
+    master[i] = p;
+    param[i] = (floatX)p;
+}
