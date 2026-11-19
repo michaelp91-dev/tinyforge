@@ -1059,19 +1059,28 @@ int main(int argc, char** argv) {
         fseek(bf, 0, SEEK_SET);
         token_bytes = (int*)malloc((size_t)cfg.V * sizeof(int));
         size_t got = 0;
-        if (sz == (long)cfg.V * 4) {
+        // train_tokenizer.py writes an int32 count header and then `count`
+        // int32 byte lengths. With --vocab one larger than the tokenizer
+        // (the usual case) that file is exactly V*4 bytes, the same size as a
+        // headerless table, so the size alone cannot tell them apart. The old
+        // code read it as headerless: every id was shifted by one and id 0
+        // (BOS) got the header value (~32767 bytes), which inflated the byte
+        // count ~9x and made bpb ~9x too small. Check the header first.
+        int count = 0;
+        if (fread(&count, 4, 1, bf) != 1) count = 0;
+        memset(token_bytes, 0, (size_t)cfg.V * sizeof(int));
+        if (count > 0 && count <= cfg.V && sz == (long)(count + 1) * 4) {
+            got = fread(token_bytes, 4, count, bf);
+            got = (got == (size_t)count) ? (size_t)cfg.V : 0;
+        } else if (sz == (long)cfg.V * 4) {
+            fseek(bf, 0, SEEK_SET);
             got = fread(token_bytes, 4, cfg.V, bf);
-        } else {
-            int count = 0;
-            if (fread(&count, 4, 1, bf) != 1) count = 0;
-            if (count < cfg.V) {
-                // The tokenizer can have one fewer entry than --vocab (BOS is in the vocab).
-                memset(token_bytes, 0, (size_t)cfg.V * sizeof(int));
-                got = fread(token_bytes, 4, count, bf);
-                got = (got == (size_t)count) ? (size_t)cfg.V : 0;
-            } else {
-                got = fread(token_bytes, 4, cfg.V, bf);
-            }
+        }
+        int maxb = 0;
+        for (int i = 0; i < cfg.V; i++) maxb = std::max(maxb, token_bytes[i]);
+        if (got == (size_t)cfg.V && maxb > 256) {
+            fprintf(stderr, "%s: a token of %d bytes looks wrong\n", token_bytes_path, maxb);
+            return 1;
         }
         if (got != (size_t)cfg.V) { fprintf(stderr, "short read on %s\n", token_bytes_path); return 1; }
         fclose(bf);
@@ -1190,7 +1199,7 @@ int main(int argc, char** argv) {
             }
             vloss /= (double)nval * B * T;
             printf("  val loss %.4f", vloss);
-            if (token_bytes && nbytes > 0) printf("  bpb %.4f", nats / (log(2.0) * nbytes));
+            if (token_bytes && nbytes > 0) printf("  bpb %.4f  (%.3f bytes/token)", nats / (log(2.0) * nbytes), nbytes / ((double)nval * B * T));
             printf("\n");
             fflush(stdout);
         }
