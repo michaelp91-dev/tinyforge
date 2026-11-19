@@ -85,7 +85,11 @@ static void prof_report(void) {
     printf("\n");
     g_prof_n = 0;
 }
-static int g_ns_fast16 = 0; // Muon Newton-Schulz GEMMs on fp16 tensor cores (fp32 in/out)
+#ifdef ENABLE_FP16
+static int g_ns_fast16 = 1; // Muon Newton-Schulz GEMMs on fp16 tensor cores (fp32 in/out); --ns-fp16 0 to disable
+#else
+static int g_ns_fast16 = 0;
+#endif
 
 static void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
