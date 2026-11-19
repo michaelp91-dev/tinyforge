@@ -259,7 +259,12 @@ static void alloc_acts(Model* m) {
     m->block_in = (floatX*)cualloc(L * BTC * sizeof(floatX));
     m->ln1 = (floatX*)cualloc(L * BTC * sizeof(floatX));
     m->ln2 = (floatX*)cualloc(L * BTC * sizeof(floatX));
-    m->qkv = (floatX*)cualloc(BT3 * sizeof(floatX));
+    // llm.c's attention_forward reuses its qkv input as the (B, NH, T, T)
+    // pre-softmax scratch, so this buffer must hold max(B*T*3C, B*NH*T*T).
+    // It used to be B*T*3C only: at d12/T=512 the scores overran it by
+    // B*T*C elements into the next allocation (silent corruption in fp32,
+    // an out-of-bounds crash in fp16; found with compute-sanitizer).
+    m->qkv = (floatX*)cualloc(std::max(BT3, (size_t)c.B * c.NH * c.T * c.T) * sizeof(floatX));
     m->atty = (floatX*)cualloc(L * BTC * sizeof(floatX));
     m->resid2 = (floatX*)cualloc(L * BTC * sizeof(floatX));
     m->preact = (floatX*)cualloc(L * BT4 * sizeof(floatX));
