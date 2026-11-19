@@ -115,6 +115,31 @@ void matmul_cublaslt(floatX* d, const floatX* a, const floatX* b, const floatX* 
     bool has_bias = (bias != NULL);
     bool has_gelu = (pre_gelu != NULL);
 
+#if defined(ENABLE_FP16) && defined(TF_FP16_GEMMEX)
+    // TinyForge fp16 (Turing T4) path: classic cuBLAS GemmEx with fp32
+    // accumulation on the tensor cores. cublasLtMatmul with fp16 in/out
+    // returned CUBLAS_STATUS_INTERNAL_ERROR on Colab's T4, and GemmEx is the
+    // path PyTorch uses there. Same column-major semantics as the Lt call below.
+    if (!has_bias && !has_gelu) {
+        const float alpha = 1.0f, beta = accumulate ? 1.0f : 0.0f;
+        cublasCheck(cublasSetStream(cublas_handle_ex, stream));
+        cublasOperation_t ta = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+        cublasOperation_t tb = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+        int lda = transA ? k : m, ldb = transB ? n : k;
+        if (batch_count) {
+            cublasCheck(cublasGemmStridedBatchedEx(cublas_handle_ex, ta, tb, m, n, k, &alpha,
+                a, CUDA_R_16F, lda, (long long)strideA, b, CUDA_R_16F, ldb, (long long)strideB,
+                &beta, d, CUDA_R_16F, m, (long long)strideOut, batch_count,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            cublasCheck(cublasGemmEx(cublas_handle_ex, ta, tb, m, n, k, &alpha,
+                a, CUDA_R_16F, lda, b, CUDA_R_16F, ldb, &beta, d, CUDA_R_16F, m,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+        return;
+    }
+#endif
+
     // check alignment (some modes work unaligned but it always best to be aligned for performance)
     if(((uintptr_t)a % 16) != 0 || ((uintptr_t)b % 16) != 0 || ((uintptr_t)d % 16) != 0 || ((uintptr_t)bias % 16) != 0) {
         printf("All cuBLASLt pointers must be aligned!\n");

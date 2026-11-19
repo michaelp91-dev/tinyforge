@@ -58,6 +58,35 @@ static void nccl_check(ncclResult_t r, const char* what) {
 #endif
 static float* g_scalar = nullptr;
 
+// --profile: time sections of one step with CUDA events (adds syncs only on that step).
+static int g_prof = 0;
+static const int PROF_MAX = 4096;
+static cudaEvent_t g_prof_ev[PROF_MAX];
+static const char* g_prof_name[PROF_MAX];
+static int g_prof_n = 0;
+static void prof_mark(const char* name) {
+    if (!g_prof || g_prof_n >= PROF_MAX) return;
+    if (!g_prof_ev[g_prof_n]) cudaEventCreate(&g_prof_ev[g_prof_n]);
+    cudaEventRecord(g_prof_ev[g_prof_n]);
+    g_prof_name[g_prof_n++] = name;
+}
+static void prof_report(void) {
+    if (!g_prof || g_prof_n < 2) return;
+    cudaEventSynchronize(g_prof_ev[g_prof_n - 1]);
+    const char* names[PROF_MAX]; float tot[PROF_MAX]; int k = 0;
+    for (int i = 1; i < g_prof_n; i++) {
+        float ms = 0; cudaEventElapsedTime(&ms, g_prof_ev[i - 1], g_prof_ev[i]);
+        int j = 0; while (j < k && strcmp(names[j], g_prof_name[i]) != 0) j++;
+        if (j == k) { names[k] = g_prof_name[i]; tot[k++] = 0; }
+        tot[j] += ms;
+    }
+    printf("profile:");
+    for (int j = 0; j < k; j++) printf("  %s %.0fms", names[j], tot[j]);
+    printf("\n");
+    g_prof_n = 0;
+}
+static int g_ns_fast16 = 0; // Muon Newton-Schulz GEMMs on fp16 tensor cores (fp32 in/out)
+
 static void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(e));
@@ -189,6 +218,16 @@ static void rms_forward(floatX* out, float* rstd, const floatX* x, int n, int C)
     tf_rmsnorm_forward_kernel<<<n, 256, 32 * sizeof(float)>>>(out, rstd, x, n, C, 1e-6f);
     ck(cudaGetLastError(), "rmsnorm forward");
 }
+static int g_fused_loss = 1;
+static void loss_launch(float* losses, floatX* logits, const int* targets, int n, int V, int Vp,
+                        float dloss, float softcap, int write_grad) {
+    if (g_fused_loss && V % x128::size == 0 && Vp % x128::size == 0) {
+        tf_loss_fused_kernel<<<n, 256>>>(losses, logits, targets, n, V, Vp, dloss, softcap, write_grad);
+    } else {
+        tf_loss_kernel<<<n, 256, 32 * sizeof(float)>>>(losses, logits, targets, n, V, Vp, dloss, softcap, write_grad);
+    }
+}
+
 static void rms_backward(floatX* dx, const floatX* dout, const floatX* x, const float* rstd, int n, int C) {
     tf_rmsnorm_backward_kernel<<<n, 256, 32 * sizeof(float)>>>(dx, dout, x, rstd, n, C);
     ck(cudaGetLastError(), "rmsnorm backward");
@@ -262,8 +301,9 @@ static void alloc_acts(Model* m) {
     // llm.c's attention_forward reuses its qkv input as the (B, NH, T, T)
     // pre-softmax scratch, so this buffer must hold max(B*T*3C, B*NH*T*T).
     // It used to be B*T*3C only: at d12/T=512 the scores overran it by
-    // B*T*C elements into the next allocation (silent corruption in fp32,
-    // an out-of-bounds crash in fp16; found with compute-sanitizer).
+    // B*T*C elements into the next allocation (layer 0's saved attention
+    // output), corrupting layer 0's attention-projection weight gradient
+    // (and crashing the fp16 build).
     m->qkv = (floatX*)cualloc(std::max(BT3, (size_t)c.B * c.NH * c.T * c.T) * sizeof(floatX));
     m->atty = (floatX*)cualloc(L * BTC * sizeof(floatX));
     m->resid2 = (floatX*)cualloc(L * BTC * sizeof(floatX));
@@ -322,6 +362,7 @@ static void tf_forward(Model* m) {
     if (c.embed_norm) rms_forward(m->x, m->embed_rstd, m->embed, BT, C);
     else ck(cudaMemcpy(m->x, m->embed, m->BTC * sizeof(floatX), cudaMemcpyDeviceToDevice), "copy x");
 
+    prof_mark("embed");
     for (int l = 0; l < L; l++) {
         floatX* cur = m->x;
         floatX* saved_in = m->block_in + (size_t)l * m->BTC;
@@ -331,15 +372,20 @@ static void tf_forward(Model* m) {
         const floatX* b1 = m->id_ln1b[l] >= 0 ? W[m->id_ln1b[l]].data : nullptr;
         norm_forward(m, l_ln1, m->ln1_mean + (size_t)l * BT, m->ln1_rstd + (size_t)l * BT, cur, w1, b1, BT);
         floatX* qb = m->id_qkvb[l] >= 0 ? W[m->id_qkvb[l]].data : nullptr;
+        prof_mark("f_norm/copy");
         matmul_forward_cublaslt(m->qkv, l_ln1, W[m->id_qkv[l]].data, qb, B, T, C, 3 * C, 0, nullptr, 0);
+        prof_mark("f_gemm");
         qk_forward(m, m->qkv, m->q_rstd + (size_t)l * BT * c.NH, m->k_rstd + (size_t)l * BT * c.NH);
+        prof_mark("f_rope_qknorm");
         floatX* l_qkvr = m->qkvr + (size_t)l * 3 * m->BTC;
         floatX* l_att = m->att + (size_t)l * m->att_one;
         floatX* l_atty = m->atty + (size_t)l * m->BTC;
         attention_forward(l_atty, l_qkvr, l_att, m->qkv, B, T, C, c.NH, 0);
+        prof_mark("f_attention");
         floatX* ab = m->id_attb[l] >= 0 ? W[m->id_attb[l]].data : nullptr;
         floatX* proj = m->dx;
         matmul_forward_cublaslt(proj, l_atty, W[m->id_att[l]].data, ab, B, T, C, C, 0, nullptr, 0);
+        prof_mark("f_gemm");
         floatX* l_r2 = m->resid2 + (size_t)l * m->BTC;
         tf_residual_kernel<<<divup(BT * C, 256), 256>>>(l_r2, saved_in, proj, BT * C);
         ck(cudaGetLastError(), "resid2");
@@ -349,21 +395,28 @@ static void tf_forward(Model* m) {
         norm_forward(m, l_ln2, m->ln2_mean + (size_t)l * BT, m->ln2_rstd + (size_t)l * BT, l_r2, w2, b2, BT);
         floatX* pre = m->preact + (size_t)l * m->BT4C;
         floatX* fcb = m->id_fcb[l] >= 0 ? W[m->id_fcb[l]].data : nullptr;
+        prof_mark("f_norm/copy");
         matmul_forward_cublaslt(pre, l_ln2, W[m->id_fc[l]].data, fcb, B, T, C, 4 * C, 0, nullptr, 0);
+        prof_mark("f_gemm");
         if (c.relu2) tf_relu2_forward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->hid, pre, (int)m->BT4C);
         else gelu_forward(m->hid, pre, (int)m->BT4C, 0);
         ck(cudaGetLastError(), "mlp act");
         floatX* fpb = m->id_fpb[l] >= 0 ? W[m->id_fpb[l]].data : nullptr;
+        prof_mark("f_relu2");
         matmul_forward_cublaslt(proj, m->hid, W[m->id_fp[l]].data, fpb, B, T, 4 * C, C, 0, nullptr, 0);
+        prof_mark("f_gemm");
         tf_residual_kernel<<<divup(BT * C, 256), 256>>>(m->x, l_r2, proj, BT * C);
         ck(cudaGetLastError(), "resid3");
+        prof_mark("f_norm/copy");
     }
     norm_forward(m, m->lnf, m->lnf_mean, m->lnf_rstd, m->x,
                  m->id_lnfw >= 0 ? W[m->id_lnfw].data : nullptr,
                  m->id_lnfb >= 0 ? W[m->id_lnfb].data : nullptr, BT);
     floatX* head = c.untie ? W[m->id_head].data : W[m->id_wte].data;
+    prof_mark("f_norm/copy");
     matmul_forward_cublaslt(m->logits, m->lnf, head, nullptr, B, T, C, c.Vp, 0, nullptr, 0);
     ck(cudaGetLastError(), "logits");
+    prof_mark("f_head");
 }
 
 static float tf_backward(Model* m, float dloss) {
@@ -371,12 +424,13 @@ static float tf_backward(Model* m, float dloss) {
     int B = c.B, T = c.T, C = c.C, L = c.L;
     int BT = B * T;
     PTensor* W = m->tensors;
-    tf_loss_kernel<<<BT, 256, 32 * sizeof(float)>>>(m->losses, m->logits, m->d_targets, BT, c.V, c.Vp,
-                                                    dloss, c.softcap, 1);
+    loss_launch(m->losses, m->logits, m->d_targets, BT, c.V, c.Vp, dloss, c.softcap, 1);
     ck(cudaGetLastError(), "loss");
+    prof_mark("loss");
     floatX* head = c.untie ? W[m->id_head].data : W[m->id_wte].data;
     floatX* dhead = c.untie ? W[m->id_head].grad : W[m->id_wte].grad;
     matmul_backward(m->dx, dhead, nullptr, m->logits, m->lnf, head, nullptr, B, T, C, c.Vp, 0, nullptr, 0);
+    prof_mark("b_head");
     floatX* dstream = m->dres;
     norm_backward(m, dstream, m->id_lnfw >= 0 ? W[m->id_lnfw].grad : nullptr,
                   m->id_lnfb >= 0 ? W[m->id_lnfb].grad : nullptr,
@@ -388,16 +442,20 @@ static float tf_backward(Model* m, float dloss) {
         floatX* pre = m->preact + (size_t)l * m->BT4C;
         if (c.relu2) tf_relu2_forward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->hid, pre, (int)m->BT4C);
         else gelu_forward(m->hid, pre, (int)m->BT4C, 0);
+        prof_mark("b_relu2");
         floatX* fpb_g = m->id_fpb[l] >= 0 ? W[m->id_fpb[l]].grad : nullptr;
         matmul_backward(m->dhid, W[m->id_fp[l]].grad, fpb_g, dstream, m->hid, W[m->id_fp[l]].data,
                         nullptr, B, T, 4 * C, C, 0, nullptr, 0);
+        prof_mark("b_gemm");
         if (c.relu2) tf_relu2_backward_kernel<<<divup((int)m->BT4C, 256), 256>>>(m->dhid, m->dhid, pre, (int)m->BT4C);
         else gelu_backward_inplace(m->dhid, pre, (int)m->BT4C, 0);
         ck(cudaGetLastError(), "act bwd");
+        prof_mark("b_relu2");
         floatX* l_ln2 = m->ln2 + (size_t)l * m->BTC;
         floatX* fcb_g = m->id_fcb[l] >= 0 ? W[m->id_fcb[l]].grad : nullptr;
         matmul_backward(m->dln, W[m->id_fc[l]].grad, fcb_g, m->dhid, l_ln2, W[m->id_fc[l]].data,
                         nullptr, B, T, C, 4 * C, 0, nullptr, 0);
+        prof_mark("b_gemm");
         norm_backward(m, m->dx,
                       m->id_ln2w[l] >= 0 ? W[m->id_ln2w[l]].grad : nullptr,
                       m->id_ln2b[l] >= 0 ? W[m->id_ln2b[l]].grad : nullptr,
@@ -405,19 +463,24 @@ static float tf_backward(Model* m, float dloss) {
                       m->id_ln2w[l] >= 0 ? W[m->id_ln2w[l]].data : nullptr,
                       m->ln2_mean + (size_t)l * BT, m->ln2_rstd + (size_t)l * BT, dstream);
         // dx is now d(resid2) = skip(dstream) + mlp norm grad. dstream can be reused.
+        prof_mark("b_norm/copy");
         floatX* l_atty = m->atty + (size_t)l * m->BTC;
         floatX* ab_g = m->id_attb[l] >= 0 ? W[m->id_attb[l]].grad : nullptr;
         matmul_backward(m->datty, W[m->id_att[l]].grad, ab_g, m->dx, l_atty, W[m->id_att[l]].data,
                         nullptr, B, T, C, C, 0, nullptr, 0);
+        prof_mark("b_gemm");
         floatX* l_qkvr = m->qkvr + (size_t)l * 3 * m->BTC;
         floatX* l_att = m->att + (size_t)l * m->att_one;
         attention_backward(m->dqkv, m->qkv, m->datt, m->scratch_btc, m->datty, l_qkvr, l_att, B, T, C, c.NH, 0);
+        prof_mark("b_attention");
         qk_backward(m, m->dqkv, l_qkvr, l_qkvr + m->BTC, m->q_rstd + (size_t)l * BT * c.NH,
                     m->k_rstd + (size_t)l * BT * c.NH);
+        prof_mark("b_rope_qknorm");
         floatX* l_ln1 = m->ln1 + (size_t)l * m->BTC;
         floatX* qb_g = m->id_qkvb[l] >= 0 ? W[m->id_qkvb[l]].grad : nullptr;
         matmul_backward(m->dln, W[m->id_qkv[l]].grad, qb_g, m->dqkv, l_ln1, W[m->id_qkv[l]].data,
                         nullptr, B, T, C, 3 * C, 0, nullptr, 0);
+        prof_mark("b_gemm");
         floatX* bin = m->block_in + (size_t)l * m->BTC;
         norm_backward(m, dstream,
                       m->id_ln1w[l] >= 0 ? W[m->id_ln1w[l]].grad : nullptr,
@@ -425,6 +488,7 @@ static float tf_backward(Model* m, float dloss) {
                       m->dln, bin,
                       m->id_ln1w[l] >= 0 ? W[m->id_ln1w[l]].data : nullptr,
                       m->ln1_mean + (size_t)l * BT, m->ln1_rstd + (size_t)l * BT, m->dx);
+        prof_mark("b_norm/copy");
     }
     // dstream is d(x) at the embedding-norm output.
     floatX* dembed = m->dx;
@@ -433,6 +497,7 @@ static float tf_backward(Model* m, float dloss) {
     tf_embed_backward_kernel<<<divup(BT * C, 256), 256>>>(
         m->emb_g32, m->wpe_g32, dembed, m->d_tokens, BT, T, C, c.rope ? 0 : 1);
     ck(cudaGetLastError(), "embed bwd");
+    prof_mark("b_embed");
 
     float* host_loss = (float*)malloc(BT * sizeof(float));
     ck(cudaMemcpy(host_loss, m->losses, BT * sizeof(float), cudaMemcpyDeviceToHost), "loss copy");
@@ -454,8 +519,15 @@ __global__ void tf_combo_kernel(float* dst, const float* a, const float* b, int 
 static void sgemm_rm(int m, int n, int k, const float* A, const float* B, float* C) {
     const float alpha = 1.f, beta = 0.f;
     // Row-major C(m,n) = A(m,k) @ B(k,n), via cuBLAS column-major on the transpose view.
-    cublasCheck(cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
-                            &alpha, B, n, A, k, &beta, C, n));
+    if (g_ns_fast16) {
+        // fp32 in/out, inputs rounded to fp16 for the tensor cores (Turing has no TF32).
+        cublasCheck(cublasGemmEx(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+                                 &alpha, B, CUDA_R_32F, n, A, CUDA_R_32F, k, &beta, C, CUDA_R_32F, n,
+                                 CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT));
+    } else {
+        cublasCheck(cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
+                                &alpha, B, n, A, k, &beta, C, n));
+    }
 }
 
 static float frobenius(Model* m, const float* x, size_t n) {
@@ -498,11 +570,17 @@ static void muon_ns_and_scale(Model* m, float* G, int rows, int cols) {
     ck(cudaGetLastError(), "muon ns");
 }
 
+// fp16 builds (Turing T4: no bf16, no TF32) use dynamic loss scaling: the
+// backward pass runs on loss * g_loss_scale so small gradients survive fp16,
+// the optimizer multiplies gradients by g_grad_unscale, and a step whose
+// gradients overflow is skipped with the scale halved.
+static float g_grad_unscale = 1.f;
+
 static void adam_update(PTensor* t, float lr, float b1, float b2, float eps, float wd, int step) {
     float b1c = 1.f - powf(b1, (float)(step + 1));
     float b2c = 1.f - powf(b2, (float)(step + 1));
     tf_adamw_kernel<<<divup((int)std::min(t->n, (size_t)1 << 30), 256), 256>>>(
-        t->master, t->data, t->grad, t->m, t->v, t->n, lr, b1, b2, b1c, b2c, eps, wd);
+        t->master, t->data, t->grad, t->m, t->v, t->n, lr, b1, b2, b1c, b2c, eps, wd, g_grad_unscale);
     ck(cudaGetLastError(), "adamw");
 }
 
@@ -536,7 +614,7 @@ static void optimizer_step(Model* m, int step, float mult, float batch_scale, fl
         } else {
             float lr = matrix_lr * batch_scale * mult;
             tf_muon_nesterov_kernel<<<divup((int)std::min(t->n, (size_t)1 << 30), 256), 256>>>(
-                m->ns_y, t->m, t->grad, t->n, momentum);
+                m->ns_y, t->m, t->grad, t->n, momentum, g_grad_unscale);
             ck(cudaGetLastError(), "nesterov");
             muon_ns_and_scale(m, m->ns_y, t->rows, t->cols);
             tf_muon_apply_kernel<<<divup((int)std::min(t->n, (size_t)1 << 30), 256), 256>>>(
@@ -569,16 +647,26 @@ static void write_model(Model* m, const char* path) {
     h[2] = c.max_seq; h[3] = c.V; h[4] = c.L; h[5] = c.NH; h[6] = c.C; h[7] = c.Vp;
     h[8] = arch_flags(&c);
     h[9] = fbits(c.softcap); h[10] = fbits(c.qk_scale); h[11] = fbits(c.rope_base);
-    h[12] = (sizeof(floatX) == 4) ? 0 : 2; // 0 fp32, 2 bf16 (this build)
+#ifdef ENABLE_FP16
+    const int write_master = 1; // fp16 build: write the fp32 master weights
+#else
+    const int write_master = 0;
+#endif
+    h[12] = (sizeof(floatX) == 4 || write_master) ? 0 : 2; // 0 fp32, 2 bf16
     h[13] = m->ntensors;
     fwrite(h, sizeof(int), 256, f);
     size_t maxn = 1;
     for (int i = 0; i < m->ntensors; i++) if (m->tensors[i].n > maxn) maxn = m->tensors[i].n;
-    floatX* host = (floatX*)malloc(maxn * sizeof(floatX));
+    float* host = (float*)malloc(maxn * sizeof(float));
     for (int i = 0; i < m->ntensors; i++) {
         PTensor* t = &m->tensors[i];
-        ck(cudaMemcpy(host, t->data, t->n * sizeof(floatX), cudaMemcpyDeviceToHost), "ckpt");
-        fwrite(host, sizeof(floatX), t->n, f);
+        if (write_master) {
+            ck(cudaMemcpy(host, t->master, t->n * sizeof(float), cudaMemcpyDeviceToHost), "ckpt");
+            fwrite(host, sizeof(float), t->n, f);
+        } else {
+            ck(cudaMemcpy(host, t->data, t->n * sizeof(floatX), cudaMemcpyDeviceToHost), "ckpt");
+            fwrite(host, sizeof(floatX), t->n, f);
+        }
     }
     free(host);
     fclose(f);
@@ -893,6 +981,12 @@ int main(int argc, char** argv) {
     int warmup = modern ? 40 : 0;
     int vocab_set = 0, sched_set = 0;
     double time_limit = 0;
+    int prof_steps = 0;
+#ifdef ENABLE_FP16
+    float loss_scale = 65536.f; // dynamic; halves on overflow, doubles after 200 clean steps
+#else
+    float loss_scale = 1.f;
+#endif
     int keep_ckpts = 0;
     const char* sync_dir = nullptr;
 
@@ -941,6 +1035,10 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--momentum") == 0) momentum = arg_float(v);
         else if (strcmp(a, "--token-bytes") == 0) token_bytes_path = v;
         else if (strcmp(a, "--time-limit") == 0) time_limit = atof(v);
+        else if (strcmp(a, "--loss-scale") == 0) loss_scale = arg_float(v);
+        else if (strcmp(a, "--profile") == 0) prof_steps = arg_int(v);
+        else if (strcmp(a, "--ns-fp16") == 0) g_ns_fast16 = arg_int(v);
+        else if (strcmp(a, "--fused-loss") == 0) g_fused_loss = arg_int(v);
         else if (strcmp(a, "--keep-ckpts") == 0) keep_ckpts = arg_int(v);
         else if (strcmp(a, "--nproc") == 0) g_world = arg_int(v);
         else if (strcmp(a, "--rank") == 0) g_rank = arg_int(v);
@@ -996,6 +1094,8 @@ int main(int argc, char** argv) {
     ck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size), "lt workspace");
     cublas_compute = CUBLAS_COMPUTE_32F;
     cublasCheck(cublasCreate(&g_cublas));
+    cublasCheck(cublasCreate(&cublas_handle_ex));
+    cublasCheck(cublasSetWorkspace(cublas_handle_ex, cublaslt_workspace, cublaslt_workspace_size));
     printf("device: %s\n", deviceProp.name);
     printf("arch %s  d%d  L=%d C=%d NH=%d HS=%d V=%d Vp=%d\n",
            modern ? "modern" : "gpt2", depth, cfg.L, cfg.C, cfg.NH, cfg.HS, cfg.V, cfg.Vp);
@@ -1013,6 +1113,76 @@ int main(int argc, char** argv) {
         ck(cudaMemGetInfo(&free_b, &total_b), "meminfo");
         printf("GPU memory after allocation: %.2f GiB used of %.2f GiB\n",
                (total_b - free_b) / 1073741824.0, total_b / 1073741824.0);
+    }
+
+    {
+        // Startup self-check of the GEMM path (cuBLASLt or the fp16 GemmEx path) in the
+        // three transpose modes the trainer uses, against a CPU reference.
+        const int M = 96, N = 64, K = 128;
+        float worst = 0.f;
+        for (int mode = 0; mode < 3; mode++) {
+            bool tA = mode == 0, tB = mode == 2;
+            floatX *ha = (floatX*)malloc(M * K * sizeof(floatX)), *hb = (floatX*)malloc(K * N * sizeof(floatX));
+            floatX* hd = (floatX*)malloc(M * N * sizeof(floatX));
+            mt19937_state r; manual_seed(&r, 11 + mode);
+            for (int i = 0; i < M * K; i++) ha[i] = (floatX)(randfloat32(&r) - 0.5f);
+            for (int i = 0; i < K * N; i++) hb[i] = (floatX)(randfloat32(&r) - 0.5f);
+            floatX *da = (floatX*)cualloc(M * K * sizeof(floatX)), *db = (floatX*)cualloc(K * N * sizeof(floatX));
+            floatX* dd = (floatX*)cualloc(M * N * sizeof(floatX));
+            ck(cudaMemcpy(da, ha, M * K * sizeof(floatX), cudaMemcpyHostToDevice), "g");
+            ck(cudaMemcpy(db, hb, K * N * sizeof(floatX), cudaMemcpyHostToDevice), "g");
+            matmul_cublaslt(dd, da, db, nullptr, M, N, K, 0, tA, tB);
+            ck(cudaMemcpy(hd, dd, M * N * sizeof(floatX), cudaMemcpyDeviceToHost), "g");
+            for (int i = 0; i < M; i++) for (int j = 0; j < N; j++) {
+                float acc = 0.f;
+                for (int kk = 0; kk < K; kk++) {
+                    float av = tA ? (float)ha[i * K + kk] : (float)ha[kk * M + i];
+                    float bv = tB ? (float)hb[kk * N + j] : (float)hb[j * K + kk];
+                    acc += av * bv;
+                }
+                worst = std::max(worst, fabsf(acc - (float)hd[j * M + i]));
+            }
+            cudaFree(da); cudaFree(db); cudaFree(dd); free(ha); free(hb); free(hd);
+        }
+        printf("gemm check: max abs error %.2e\n", worst);
+        if (worst > 2e-2f) { fprintf(stderr, "GEMM self-check failed\n"); return 1; }
+    }
+    if (g_fused_loss) {
+        // Startup self-check: fused loss kernel against the reference kernel on random logits.
+        int n = 64, V = cfg.V, Vp = cfg.Vp;
+        size_t ne = (size_t)n * Vp;
+        floatX* h = (floatX*)malloc(ne * sizeof(floatX));
+        int* ht = (int*)malloc(n * sizeof(int));
+        mt19937_state r; manual_seed(&r, 7);
+        for (size_t i = 0; i < ne; i++) h[i] = (floatX)(8.f * (randfloat32(&r) - 0.5f) * (i % 97 == 0 ? 6.f : 1.f));
+        for (int i = 0; i < n; i++) ht[i] = (int)(randfloat32(&r) * (V - 1));
+        floatX* a = (floatX*)cualloc(ne * sizeof(floatX));
+        floatX* b = (floatX*)cualloc(ne * sizeof(floatX));
+        float* la = (float*)cualloc(n * sizeof(float));
+        float* lb = (float*)cualloc(n * sizeof(float));
+        int* dt = (int*)cualloc(n * sizeof(int));
+        ck(cudaMemcpy(a, h, ne * sizeof(floatX), cudaMemcpyHostToDevice), "chk");
+        ck(cudaMemcpy(b, h, ne * sizeof(floatX), cudaMemcpyHostToDevice), "chk");
+        ck(cudaMemcpy(dt, ht, n * sizeof(int), cudaMemcpyHostToDevice), "chk");
+        float dl = 1024.f / n;
+        tf_loss_kernel<<<n, 256, 32 * sizeof(float)>>>(la, a, dt, n, V, Vp, dl, cfg.softcap, 1);
+        tf_loss_fused_kernel<<<n, 256>>>(lb, b, dt, n, V, Vp, dl, cfg.softcap, 1);
+        ck(cudaDeviceSynchronize(), "loss check");
+        float hla[64], hlb[64];
+        ck(cudaMemcpy(hla, la, n * sizeof(float), cudaMemcpyDeviceToHost), "chk");
+        ck(cudaMemcpy(hlb, lb, n * sizeof(float), cudaMemcpyDeviceToHost), "chk");
+        floatX* ga = (floatX*)malloc(ne * sizeof(floatX));
+        ck(cudaMemcpy(h, a, ne * sizeof(floatX), cudaMemcpyDeviceToHost), "chk");
+        ck(cudaMemcpy(ga, b, ne * sizeof(floatX), cudaMemcpyDeviceToHost), "chk");
+        double dmax = 0, gmax = 0, gref = 0;
+        for (int i = 0; i < n; i++) dmax = std::max(dmax, (double)fabsf(hla[i] - hlb[i]));
+        for (size_t i = 0; i < ne; i++) {
+            gmax = std::max(gmax, (double)fabsf((float)h[i] - (float)ga[i]));
+            gref = std::max(gref, (double)fabsf((float)h[i]));
+        }
+        printf("fused loss check: max |dloss| %.2e (loss ~%.2f), max |dgrad| %.2e of %.2e\n", dmax, hla[0], gmax, gref);
+        if (dmax > 1e-3 || gmax > 1e-2 * gref) { fprintf(stderr, "fused loss kernel mismatch; use --fused-loss 0\n"); return 1; }
+        cudaFree(a); cudaFree(b); cudaFree(la); cudaFree(lb); cudaFree(dt); free(h); free(ht); free(ga);
     }
 
     int start_step = 0, resume_shard = 0, resume_sample = 0, resume_world = 1;
@@ -1116,6 +1286,9 @@ int main(int argc, char** argv) {
         prune_ckpts(out_dir, keep_ckpts);
         fflush(stdout);
     };
+    int* d_nonfinite = (int*)cualloc(sizeof(int));
+    int clean_steps = 0, skipped_steps = 0;
+    if (loss_scale != 1.f) printf("fp16 dynamic loss scale, start %.0f\n", loss_scale);
     double t_start = now_seconds();
     double step_time_sum = 0;
     int step_time_n = 0;
@@ -1124,9 +1297,12 @@ int main(int argc, char** argv) {
         cudaEvent_t ev0, ev1;
         cudaEventCreate(&ev0); cudaEventCreate(&ev1);
         cudaEventRecord(ev0);
+        g_prof = (prof_steps > 0 && step >= start_step + 2 && step < start_step + 2 + prof_steps);
+        prof_mark("start");
         zero_grads(model);
+        prof_mark("zero");
         double loss_sum = 0;
-        float dloss = 1.f / (float)(B * T * accum);
+        float dloss = loss_scale / (float)(B * T * accum);
         for (int micro = 0; micro < accum; micro++) {
             dataloader_next_batch(&train_loader);
             for (int i = 0; i < B * T; i++) {
@@ -1139,15 +1315,43 @@ int main(int argc, char** argv) {
             }
             ck(cudaMemcpy(model->d_tokens, h_tok, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice), "tok");
             ck(cudaMemcpy(model->d_targets, h_tgt, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice), "tgt");
+            prof_mark("data");
             tf_forward(model);
             loss_sum += tf_backward(model, dloss);
         }
         fold_embed_grads(model);
         dist_average_grads(model);
+        prof_mark("fold+allreduce");
         float mult = lr_multiplier(step, max_steps, warmup, warmdown, final_frac, sched);
-        optimizer_step(model, step, mult, batch_scale, dmodel_scale,
-                       matrix_lr, embed_lr, unembed_lr, muon_wd, embed_wd, head_wd, vec_wd,
-                       momentum, modern ? 0 : 1, gpt2_lr, vec_wd);
+        int overflow = 0;
+        if (loss_scale != 1.f) {
+            ck(cudaMemsetAsync(d_nonfinite, 0, sizeof(int)), "flag");
+            for (int i = 0; i < model->ntensors; i++) {
+                PTensor* t = &model->tensors[i];
+                if (t->n == 0) continue;
+                int blocks = (int)std::min((size_t)1024, (t->n + 255) / 256);
+                tf_nonfinite_kernel<<<blocks, 256>>>(d_nonfinite, t->grad, t->n);
+            }
+            ck(cudaMemcpy(&overflow, d_nonfinite, sizeof(int), cudaMemcpyDeviceToHost), "flag read");
+        }
+        if (overflow) {
+            // Gradients are identical on every rank after the all-reduce, so all ranks skip together.
+            loss_scale = std::max(1.f, loss_scale * 0.5f);
+            clean_steps = 0;
+            skipped_steps++;
+            printf("step %d: fp16 gradient overflow, step skipped, loss scale -> %.0f\n", step + 1, loss_scale);
+        } else {
+            g_grad_unscale = 1.f / loss_scale;
+            optimizer_step(model, step, mult, batch_scale, dmodel_scale,
+                           matrix_lr, embed_lr, unembed_lr, muon_wd, embed_wd, head_wd, vec_wd,
+                           momentum, modern ? 0 : 1, gpt2_lr, vec_wd);
+            if (loss_scale != 1.f && ++clean_steps >= 200 && loss_scale < 16777216.f) {
+                loss_scale *= 2.f;
+                clean_steps = 0;
+            }
+        }
+        prof_mark("optimizer");
+        prof_report();
         if (g_world > 1 && (step == start_step || (step + 1) % 100 == 0)) {
             // Every rank applies the same averaged gradient, so weights must match.
             PTensor* probe = &model->tensors[model->id_qkv[0]];
@@ -1190,8 +1394,7 @@ int main(int argc, char** argv) {
                 ck(cudaMemcpy(model->d_tokens, h_tok, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice), "vtok");
                 ck(cudaMemcpy(model->d_targets, h_tgt, (size_t)B * T * sizeof(int), cudaMemcpyHostToDevice), "vtgt");
                 tf_forward(model);
-                tf_loss_kernel<<<B * T, 256, 32 * sizeof(float)>>>(model->losses, model->logits, model->d_targets,
-                                                                   B * T, cfg.V, cfg.Vp, 0.f, cfg.softcap, 0);
+                loss_launch(model->losses, model->logits, model->d_targets, B * T, cfg.V, cfg.Vp, 0.f, cfg.softcap, 0);
                 ck(cudaMemcpy(h_loss, model->losses, (size_t)B * T * sizeof(float), cudaMemcpyDeviceToHost), "vloss");
                 for (int i = 0; i < B * T; i++) {
                     vloss += h_loss[i];

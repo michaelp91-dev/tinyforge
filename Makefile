@@ -7,9 +7,17 @@ NVCC_ARCH ?= -gencode arch=compute_80,code=compute_80 -gencode arch=compute_80,c
 NVCC_FLAGS ?= -std=c++17 -O3 --use_fast_math $(NVCC_ARCH) -Ithird_party/llm.c -Isrc
 NVCC_LIBS ?= -lcublas -lcublasLt -lnvToolsExt
 
-# make GPU=t4: Turing (Colab/Kaggle T4) has no bf16, so build sm_75 in fp32.
+# make GPU=t4: Turing (Colab/Kaggle T4) has no bf16 and no TF32. The default
+# is fp16 activations/weights on the tensor cores with fp32 master weights,
+# fp32 optimizer state and dynamic loss scaling. T4_PREC=fp32 builds the old
+# all-fp32 trainer (no tensor cores, ~3x slower).
+T4_PREC ?= fp16
 ifeq ($(GPU),t4)
+ifeq ($(T4_PREC),fp32)
 NVCC_ARCH := -gencode arch=compute_75,code=sm_75 -DENABLE_FP32
+else
+NVCC_ARCH := -gencode arch=compute_75,code=sm_75 -DENABLE_FP16 -DTF_FP16_GEMMEX
+endif
 NVCC_LIBS := -lcublas -lcublasLt
 endif
 

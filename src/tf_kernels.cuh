@@ -279,10 +279,10 @@ __global__ void tf_qk_backward_kernel(floatX* dqkv, const floatX* q_post, const 
 __global__ void tf_adamw_kernel(float* master, floatX* param, const floatX* grad,
                                 float* m, float* v, size_t n,
                                 float lr, float beta1, float beta2, float b1c, float b2c,
-                                float eps, float wd) {
+                                float eps, float wd, float gscale) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = (float)grad[i];
+    float g = (float)grad[i] * gscale;
     float mi = beta1 * m[i] + (1.f - beta1) * g;
     float vi = beta2 * v[i] + (1.f - beta2) * g * g;
     m[i] = mi;
@@ -298,10 +298,10 @@ __global__ void tf_adamw_kernel(float* master, floatX* param, const floatX* grad
 // buf = momentum * buf + (1 - momentum) * grad
 // out = (1 - momentum) * grad + momentum * buf   (Nesterov)
 __global__ void tf_muon_nesterov_kernel(float* out, float* buf, const floatX* grad,
-                                        size_t n, float momentum) {
+                                        size_t n, float momentum, float gscale) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float g = (float)grad[i];
+    float g = (float)grad[i] * gscale;
     float b = momentum * buf[i] + (1.f - momentum) * g;
     buf[i] = b;
     out[i] = (1.f - momentum) * g + momentum * b;
@@ -342,4 +342,100 @@ __global__ void tf_frobenius_kernel(float* partial, const float* x, size_t n) {
     __shared__ float smem[32];
     ss = tf_block_sum(ss, smem);
     if (threadIdx.x == 0) partial[blockIdx.x] = ss;
+}
+
+// Sets *flag to 1 if any gradient is inf/nan (fp16 loss-scale overflow).
+__global__ void tf_nonfinite_kernel(int* flag, const floatX* g, size_t n) {
+    int bad = 0;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        float v = (float)g[i];
+        bad |= !isfinite(v);
+    }
+    if (__syncthreads_or(bad) && threadIdx.x == 0) *flag = 1;
+}
+
+// Fused softcap + cross-entropy, two passes over the logits instead of three:
+// pass 1 is an online (running max, running sum) softmax with 128-bit loads,
+// pass 2 writes the gradient. Same math as tf_loss_kernel. Needs V % x128::size == 0
+// and Vp % x128::size == 0 (the caller falls back otherwise).
+__global__ void tf_loss_fused_kernel(float* losses, floatX* logits, const int* targets,
+                                     int n, int V, int Vp, float dloss, float softcap, int write_grad) {
+    int row = blockIdx.x;
+    if (row >= n) return;
+    __shared__ float sm_m[32], sm_s[32];
+    floatX* z = logits + (size_t)row * Vp;
+    const float inv_cap = softcap > 0.f ? 1.f / softcap : 0.f;
+    float m = -1e30f, s = 0.f;
+    for (int j = threadIdx.x * x128::size; j < V; j += blockDim.x * x128::size) {
+        x128 p = load128(z + j);
+        float v[x128::size];
+        float lm = m;
+        #pragma unroll
+        for (int k = 0; k < x128::size; k++) {
+            float x = (float)p[k];
+            if (softcap > 0.f) x = softcap * tanhf(x * inv_cap);
+            v[k] = x;
+            lm = fmaxf(lm, x);
+        }
+        s *= expf(m - lm);
+        #pragma unroll
+        for (int k = 0; k < x128::size; k++) s += expf(v[k] - lm);
+        m = lm;
+    }
+    // combine (m, s) pairs across the block
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        float om = __shfl_down_sync(0xffffffff, m, off);
+        float os = __shfl_down_sync(0xffffffff, s, off);
+        float nm = fmaxf(m, om);
+        s = s * expf(m - nm) + os * expf(om - nm);
+        m = nm;
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) { sm_m[warp] = m; sm_s[warp] = s; }
+    __syncthreads();
+    if (warp == 0) {
+        int nw = blockDim.x >> 5;
+        m = lane < nw ? sm_m[lane] : -1e30f;
+        s = lane < nw ? sm_s[lane] : 0.f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float om = __shfl_down_sync(0xffffffff, m, off);
+            float os = __shfl_down_sync(0xffffffff, s, off);
+            float nm = fmaxf(m, om);
+            s = s * expf(m - nm) + os * expf(om - nm);
+            m = nm;
+        }
+        if (lane == 0) { sm_m[0] = m; sm_s[0] = s; }
+    }
+    __syncthreads();
+    m = sm_m[0]; s = sm_s[0];
+    int tgt = targets[row];
+    if (threadIdx.x == 0) {
+        float vt = (float)z[tgt];
+        if (softcap > 0.f) vt = softcap * tanhf(vt * inv_cap);
+        losses[row] = (logf(s) + m) - vt;
+    }
+    if (!write_grad) return;
+    __syncthreads(); // everyone has read z[tgt] before it is overwritten
+    const float inv = 1.f / s;
+    for (int j = threadIdx.x * x128::size; j < Vp; j += blockDim.x * x128::size) {
+        x128 p = load128(z + j);
+        x128 o;
+        #pragma unroll
+        for (int k = 0; k < x128::size; k++) {
+            int jj = j + k;
+            float dz = 0.f;
+            if (jj < V) {
+                float raw = (float)p[k];
+                float th = 0.f, v = raw;
+                if (softcap > 0.f) { th = tanhf(raw * inv_cap); v = softcap * th; }
+                float pr = expf(v - m) * inv;
+                dz = (pr - (jj == tgt ? 1.f : 0.f)) * dloss;
+                if (softcap > 0.f) dz *= (1.f - th * th);
+            }
+            o[k] = (floatX)dz;
+        }
+        store128(z + j, o);
+    }
 }
