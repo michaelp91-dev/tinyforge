@@ -16,6 +16,11 @@ import numpy as np
 
 
 BOS = "<|bos|>"
+# Chat markers for the supervised fine-tune (nanochat names). They are never
+# seen in pretraining; their embeddings are learned during SFT. They count as
+# 0 bytes in bits-per-byte, like BOS.
+CHAT_SPECIALS = ["<|user_start|>", "<|user_end|>", "<|assistant_start|>", "<|assistant_end|>"]
+SPECIALS = [BOS] + CHAT_SPECIALS
 # GPT-2 bytes <-> unicode, so a token string can be turned back into raw bytes
 # without decoding it as UTF-8 (which corrupts tokens that are not valid text).
 def _bytes_to_unicode():
@@ -57,8 +62,10 @@ def train(texts, vocab_size, out_dir):
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
     tokenizer.decoder = ByteLevelDecoder()
     trainer = BpeTrainer(
-        vocab_size=vocab_size - 1,  # reserve one id for BOS
-        special_tokens=[BOS],
+        vocab_size=vocab_size - 1,  # one id left free under --vocab
+        special_tokens=SPECIALS,
+        # all 256 bytes, so text with a byte the sample never had still encodes
+        initial_alphabet=ByteLevel.alphabet(),
         show_progress=True,
     )
     tokenizer.train_from_iterator(texts, trainer=trainer)
@@ -71,6 +78,7 @@ def train(texts, vocab_size, out_dir):
         tokenizer_object=tokenizer,
         bos_token=BOS,
         unk_token=None,
+        additional_special_tokens=CHAT_SPECIALS,
         model_max_length=8192,
     )
     fast.save_pretrained(out_dir)
@@ -79,7 +87,7 @@ def train(texts, vocab_size, out_dir):
     counts = np.zeros(n, dtype=np.int32)
     for i in range(n):
         tok = tokenizer.id_to_token(i)
-        counts[i] = 0 if tok == BOS else token_nbytes(tok, {BOS})
+        counts[i] = token_nbytes(tok, set(SPECIALS))
     np.save(out_dir / "token_bytes.npy", counts)
     with open(out_dir / "token_bytes.bin", "wb") as f:
         np.array([n], dtype=np.int32).tofile(f)

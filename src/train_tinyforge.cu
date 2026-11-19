@@ -21,6 +21,9 @@ embeddings. Flags below turn each of those off individually.
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <ctime>
+#include <dirent.h>
+#include <unistd.h>
 
 #include "llmc/cuda_common.h"
 cudaDeviceProp deviceProp;
@@ -33,6 +36,28 @@ cudaDeviceProp deviceProp;
 
 static cublasHandle_t g_cublas;
 
+// Data parallel over one node: one process per GPU, gradients averaged with
+// NCCL before the optimizer step. Build with -DTF_NCCL -lnccl (make USE_NCCL=1).
+static int g_rank = 0, g_world = 1;
+#ifdef TF_NCCL
+#include <nccl.h>
+static ncclComm_t g_nccl;
+#if defined(ENABLE_FP32)
+#define TF_NCCL_FLOATX ncclFloat
+#elif defined(ENABLE_FP16)
+#define TF_NCCL_FLOATX ncclHalf
+#else
+#define TF_NCCL_FLOATX ncclBfloat16
+#endif
+static void nccl_check(ncclResult_t r, const char* what) {
+    if (r != ncclSuccess) {
+        fprintf(stderr, "NCCL error in %s: %s\n", what, ncclGetErrorString(r));
+        exit(1);
+    }
+}
+#endif
+static float* g_scalar = nullptr;
+
 static void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(e));
@@ -44,6 +69,61 @@ static void* cualloc(size_t bytes) {
     ck(cudaMalloc(&p, bytes), "cudaMalloc");
     ck(cudaMemset(p, 0, bytes), "cudaMemset");
     return p;
+}
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static void dist_init(const char* sync_dir) {
+#ifdef TF_NCCL
+    if (g_world <= 1) return;
+    char path[512], tmp[512];
+    snprintf(path, sizeof(path), "%s/nccl_id.bin", sync_dir);
+    snprintf(tmp, sizeof(tmp), "%s/nccl_id.bin.tmp", sync_dir);
+    ncclUniqueId id;
+    if (g_rank == 0) {
+        nccl_check(ncclGetUniqueId(&id), "unique id");
+        FILE* f = fopen(tmp, "wb");
+        if (!f || fwrite(&id, sizeof(id), 1, f) != 1) { fprintf(stderr, "cannot write %s\n", tmp); exit(1); }
+        fclose(f);
+        if (rename(tmp, path) != 0) { fprintf(stderr, "cannot rename %s\n", tmp); exit(1); }
+    } else {
+        int ok = 0;
+        for (int i = 0; i < 6000 && !ok; i++) {
+            FILE* f = fopen(path, "rb");
+            if (f) {
+                ok = fread(&id, sizeof(id), 1, f) == 1;
+                fclose(f);
+            }
+            if (!ok) usleep(100000);
+        }
+        if (!ok) { fprintf(stderr, "rank %d: no %s after 10 min\n", g_rank, path); exit(1); }
+    }
+    nccl_check(ncclCommInitRank(&g_nccl, g_world, id, g_rank), "comm init");
+    printf("rank %d/%d: NCCL ready\n", g_rank, g_world);
+#else
+    (void)sync_dir;
+    if (g_world > 1) {
+        fprintf(stderr, "--nproc %d needs a build with NCCL (make USE_NCCL=1)\n", g_world);
+        exit(1);
+    }
+#endif
+}
+
+// Sum (op 0) or max (op 1) of one float across ranks.
+static float dist_reduce(float x, int op) {
+#ifdef TF_NCCL
+    if (g_world <= 1) return x;
+    ck(cudaMemcpy(g_scalar, &x, sizeof(float), cudaMemcpyHostToDevice), "scalar up");
+    nccl_check(ncclAllReduce(g_scalar, g_scalar, 1, ncclFloat, op ? ncclMax : ncclSum, g_nccl, 0), "scalar");
+    ck(cudaMemcpy(&x, g_scalar, sizeof(float), cudaMemcpyDeviceToHost), "scalar down");
+#else
+    (void)op;
+#endif
+    return x;
 }
 
 enum { KIND_EMB = 0, KIND_HEAD = 1, KIND_VEC = 2, KIND_MUON = 3, KIND_MAT = 4 };
@@ -505,7 +585,7 @@ static void write_state(Model* m, const char* path, int step, int shard, int sam
     int h[256];
     memset(h, 0, sizeof(h));
     h[0] = 20241115; h[1] = 1; h[2] = step; h[3] = shard; h[4] = sample;
-    h[5] = m->cfg.B; h[6] = m->cfg.T;
+    h[5] = m->cfg.B; h[6] = m->cfg.T; h[7] = g_world;
     fwrite(h, sizeof(int), 256, f);
     size_t maxn = 1;
     for (int i = 0; i < m->ntensors; i++) if (m->tensors[i].n > maxn) maxn = m->tensors[i].n;
@@ -525,7 +605,7 @@ static void write_state(Model* m, const char* path, int step, int shard, int sam
     fclose(f);
 }
 
-static void read_state(Model* m, const char* path, int* step, int* shard, int* sample) {
+static void read_state(Model* m, const char* path, int* step, int* shard, int* sample, int* world) {
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "cannot read %s\n", path); exit(1); }
     int h[256];
@@ -533,6 +613,7 @@ static void read_state(Model* m, const char* path, int* step, int* shard, int* s
         fprintf(stderr, "bad state file %s\n", path); exit(1);
     }
     *step = h[2]; *shard = h[3]; *sample = h[4];
+    *world = h[7] > 0 ? h[7] : 1;
     if (h[5] != m->cfg.B || h[6] != m->cfg.T) {
         fprintf(stderr, "state was saved with B=%d T=%d, this run is B=%d T=%d\n", h[5], h[6], m->cfg.B, m->cfg.T);
         exit(1);
@@ -692,6 +773,48 @@ static void fold_embed_grads(Model* m) {
     ck(cudaGetLastError(), "fold embed");
 }
 
+static void dist_average_grads(Model* m) {
+#ifdef TF_NCCL
+    if (g_world <= 1) return;
+    nccl_check(ncclGroupStart(), "group start");
+    for (int i = 0; i < m->ntensors; i++) {
+        PTensor* t = &m->tensors[i];
+        nccl_check(ncclAllReduce(t->grad, t->grad, t->n, TF_NCCL_FLOATX, ncclAvg, g_nccl, 0), "grads");
+    }
+    nccl_check(ncclGroupEnd(), "group end");
+    ck(cudaStreamSynchronize(0), "grad sync");
+#else
+    (void)m;
+#endif
+}
+
+// Write to a temp name and rename, so a killed session never leaves a
+// half-written file under the real name. DONE_ is written last.
+static void finish_file(const char* tmp, const char* path) {
+    if (rename(tmp, path) != 0) { fprintf(stderr, "cannot rename %s\n", tmp); exit(1); }
+}
+
+// Keep only the newest `keep` checkpoints in dir.
+static void prune_ckpts(const char* dir, int keep) {
+    if (keep <= 0) return;
+    int steps[4096];
+    int n = 0;
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL && n < 4096) {
+        if (strncmp(e->d_name, "DONE_", 5) == 0) steps[n++] = atoi(e->d_name + 5);
+    }
+    closedir(d);
+    std::sort(steps, steps + n);
+    for (int i = 0; i + keep < n; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/DONE_%08d", dir, steps[i]); remove(path);
+        snprintf(path, sizeof(path), "%s/model_%08d.bin", dir, steps[i]); remove(path);
+        snprintf(path, sizeof(path), "%s/state_%08d.bin", dir, steps[i]); remove(path);
+    }
+}
+
 static float lr_multiplier(int step, int total, int warmup, float warmdown, float final_frac, const char* sched) {
     if (total < 1) total = 1;
     if (strcmp(sched, "constant") == 0) return 1.f;
@@ -726,6 +849,8 @@ static void usage(void) {
         "  --muon-wd 0 --embed-wd 0.001 --head-wd 0.01 -c <wd for gpt2 / vec>\n"
         "  --warmup 40 --warmdown 0.65 --final-lr-frac 0.05 -k warmdown|cosine|linear|constant\n"
         "  --momentum 0.95 --token-bytes <int32 file>\n"
+        "  --time-limit <seconds: checkpoint and exit>  --keep-ckpts <N newest kept>\n"
+        "  --nproc N --rank R --sync-dir <dir>   (one process per GPU, NCCL build)\n"
         "Stock GPT-2 baseline (bit-level llm.c): make -C third_party/llm.c train_gpt2cu\n");
     exit(1);
 }
@@ -762,6 +887,9 @@ int main(int argc, char** argv) {
     float momentum = 0.95f;
     int warmup = modern ? 40 : 0;
     int vocab_set = 0, sched_set = 0;
+    double time_limit = 0;
+    int keep_ckpts = 0;
+    const char* sync_dir = nullptr;
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -807,6 +935,11 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--head-wd") == 0) head_wd = arg_float(v);
         else if (strcmp(a, "--momentum") == 0) momentum = arg_float(v);
         else if (strcmp(a, "--token-bytes") == 0) token_bytes_path = v;
+        else if (strcmp(a, "--time-limit") == 0) time_limit = atof(v);
+        else if (strcmp(a, "--keep-ckpts") == 0) keep_ckpts = arg_int(v);
+        else if (strcmp(a, "--nproc") == 0) g_world = arg_int(v);
+        else if (strcmp(a, "--rank") == 0) g_rank = arg_int(v);
+        else if (strcmp(a, "--sync-dir") == 0) sync_dir = v;
         else usage();
     }
     (void)sched_set; (void)vocab_set;
@@ -839,15 +972,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "head dim %d is not supported (need a multiple of 32, <= 256)\n", cfg.HS);
         return 1;
     }
-    if (total_batch < 0) total_batch = B * T;
-    if (total_batch % (B * T) != 0) {
-        fprintf(stderr, "total batch %d is not a multiple of B*T = %d\n", total_batch, B * T);
+    if (g_world < 1 || g_rank < 0 || g_rank >= g_world) { fprintf(stderr, "bad --nproc/--rank\n"); return 1; }
+    if (g_world > 1 && !sync_dir) sync_dir = out_dir ? out_dir : ".";
+    if (total_batch < 0) total_batch = B * T * g_world;
+    if (total_batch % (B * T * g_world) != 0) {
+        fprintf(stderr, "total batch %d is not a multiple of B*T*nproc = %d\n", total_batch, B * T * g_world);
         return 1;
     }
-    int accum = total_batch / (B * T);
+    int accum = total_batch / (B * T * g_world);
+    // Only rank 0 talks; the other ranks print errors only.
+    if (g_rank != 0 && !freopen("/dev/null", "w", stdout)) return 1;
 
-    ck(cudaSetDevice(0), "set device");
-    ck(cudaGetDeviceProperties(&deviceProp, 0), "device");
+    ck(cudaSetDevice(g_rank), "set device");
+    ck(cudaGetDeviceProperties(&deviceProp, g_rank), "device");
+    g_scalar = (float*)cualloc(sizeof(float));
+    dist_init(sync_dir);
     cublasCheck(cublasLtCreate(&cublaslt_handle));
     ck(cudaMalloc(&cublaslt_workspace, cublaslt_workspace_size), "lt workspace");
     cublas_compute = CUBLAS_COMPUTE_32F;
@@ -858,22 +997,33 @@ int main(int argc, char** argv) {
     printf("rope=%d rmsnorm=%d qknorm=%d relu2=%d untie=%d bias=%d embed_norm=%d softcap=%.3f optim=%s\n",
            cfg.rope, cfg.rmsnorm, cfg.qknorm, cfg.relu2, cfg.untie, cfg.bias, cfg.embed_norm, cfg.softcap,
            muon ? "muon" : "adamw");
-    printf("B=%d T=%d total_batch=%d accum=%d\n", B, T, total_batch, accum);
+    printf("B=%d T=%d nproc=%d total_batch=%d accum=%d\n", B, T, g_world, total_batch, accum);
 
     Model* model = (Model*)calloc(1, sizeof(Model));
     model->cfg = cfg;
     register_model(model, muon);
     alloc_acts(model);
+    {
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "meminfo");
+        printf("GPU memory after allocation: %.2f GiB used of %.2f GiB\n",
+               (total_b - free_b) / 1073741824.0, total_b / 1073741824.0);
+    }
 
-    int start_step = 0, resume_shard = 0, resume_sample = 0;
+    int start_step = 0, resume_shard = 0, resume_sample = 0, resume_world = 1;
     int resuming = 0;
     if (resume && out_dir) {
         int done = find_max_step(out_dir);
         if (done > 0) {
             char path[512];
             snprintf(path, sizeof(path), "%s/state_%08d.bin", out_dir, done);
-            read_state(model, path, &start_step, &resume_shard, &resume_sample);
+            read_state(model, path, &start_step, &resume_shard, &resume_sample, &resume_world);
             resuming = 1;
+            if (resume_world != g_world) {
+                // A loader sample is nproc*B*T tokens, so rescale the cursor.
+                resume_sample = (int)((long long)resume_sample * resume_world / g_world);
+                printf("checkpoint was nproc=%d, now nproc=%d: data cursor rescaled\n", resume_world, g_world);
+            }
             printf("resumed from step %d\n", start_step);
         }
     }
@@ -886,7 +1036,7 @@ int main(int argc, char** argv) {
     // Re-init correctly if the expression was wrong for gpt2: handled.
 
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_pat, B, T, 0, 1, 0);
+    dataloader_init(&train_loader, train_pat, B, T, g_rank, g_world, 0);
     dataloader_init(&val_loader, val_pat, B, T, 0, 1, 0);
     if (resuming) dataloader_resume(&train_loader, resume_shard, resume_sample);
 
@@ -908,14 +1058,22 @@ int main(int argc, char** argv) {
         long sz = ftell(bf);
         fseek(bf, 0, SEEK_SET);
         token_bytes = (int*)malloc((size_t)cfg.V * sizeof(int));
+        size_t got = 0;
         if (sz == (long)cfg.V * 4) {
-            fread(token_bytes, 4, cfg.V, bf);
+            got = fread(token_bytes, 4, cfg.V, bf);
         } else {
             int count = 0;
-            fread(&count, 4, 1, bf);
-            if (count < cfg.V) { fprintf(stderr, "token_bytes count %d < vocab %d\n", count, cfg.V); return 1; }
-            fread(token_bytes, 4, cfg.V, bf);
+            if (fread(&count, 4, 1, bf) != 1) count = 0;
+            if (count < cfg.V) {
+                // The tokenizer can have one fewer entry than --vocab (BOS is in the vocab).
+                memset(token_bytes, 0, (size_t)cfg.V * sizeof(int));
+                got = fread(token_bytes, 4, count, bf);
+                got = (got == (size_t)count) ? (size_t)cfg.V : 0;
+            } else {
+                got = fread(token_bytes, 4, cfg.V, bf);
+            }
         }
+        if (got != (size_t)cfg.V) { fprintf(stderr, "short read on %s\n", token_bytes_path); return 1; }
         fclose(bf);
     }
 
@@ -924,18 +1082,29 @@ int main(int argc, char** argv) {
     int* h_tgt = (int*)malloc((size_t)B * T * sizeof(int));
     float* h_loss = (float*)malloc((size_t)B * T * sizeof(float));
 
+    int last_saved = resuming ? start_step : -1;
     auto save_ckpt = [&](int completed) {
-        if (!out_dir) return;
-        char path[512];
+        if (!out_dir || g_rank != 0 || completed == last_saved) return;
+        char path[512], tmp[520];
         snprintf(path, sizeof(path), "%s/model_%08d.bin", out_dir, completed);
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
         printf("writing %s\n", path);
-        write_model(model, path);
+        write_model(model, tmp);
+        finish_file(tmp, path);
         snprintf(path, sizeof(path), "%s/state_%08d.bin", out_dir, completed);
-        write_state(model, path, completed, (int)train_loader.current_shard_idx, (int)train_loader.current_sample_idx);
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        write_state(model, tmp, completed, (int)train_loader.current_shard_idx, (int)train_loader.current_sample_idx);
+        finish_file(tmp, path);
         snprintf(path, sizeof(path), "%s/DONE_%08d", out_dir, completed);
         FILE* df = fopen(path, "w");
         if (df) fclose(df);
+        last_saved = completed;
+        prune_ckpts(out_dir, keep_ckpts);
+        fflush(stdout);
     };
+    double t_start = now_seconds();
+    double step_time_sum = 0;
+    int step_time_n = 0;
 
     for (int step = start_step; step < max_steps; step++) {
         cudaEvent_t ev0, ev1;
@@ -960,21 +1129,39 @@ int main(int argc, char** argv) {
             loss_sum += tf_backward(model, dloss);
         }
         fold_embed_grads(model);
+        dist_average_grads(model);
         float mult = lr_multiplier(step, max_steps, warmup, warmdown, final_frac, sched);
         optimizer_step(model, step, mult, batch_scale, dmodel_scale,
                        matrix_lr, embed_lr, unembed_lr, muon_wd, embed_wd, head_wd, vec_wd,
                        momentum, modern ? 0 : 1, gpt2_lr, vec_wd);
+        if (g_world > 1 && (step == start_step || (step + 1) % 100 == 0)) {
+            // Every rank applies the same averaged gradient, so weights must match.
+            PTensor* probe = &model->tensors[model->id_qkv[0]];
+            float f = frobenius(model, probe->master, probe->n);
+            float fmax = dist_reduce(f, 1), fsum = dist_reduce(f, 0);
+            if (fabsf(fmax - fsum / g_world) > 1e-5f * fmaxf(fmax, 1e-20f)) {
+                fprintf(stderr, "ranks out of sync at step %d (%g vs mean %g)\n", step + 1, fmax, fsum / g_world);
+                return 3;
+            }
+        }
         cudaEventRecord(ev1);
         cudaEventSynchronize(ev1);
         float ms = 0;
         cudaEventElapsedTime(&ms, ev0, ev1);
         cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-        double loss = loss_sum / accum;
-        printf("step %d/%d  loss %.4f  lr_mult %.3f  %.2fs  %.0f tok/s\n",
-               step + 1, max_steps, loss, mult, ms / 1e3, (total_batch / (ms / 1e3)));
+        double loss = dist_reduce((float)(loss_sum / accum), 0) / g_world;
+        if (step > start_step) { step_time_sum += ms / 1e3; step_time_n++; }
+        double avg = step_time_n ? step_time_sum / step_time_n : ms / 1e3;
+        printf("step %d/%d  loss %.4f  lr_mult %.3f  %.2fs  %.0f tok/s  eta %.1fh\n",
+               step + 1, max_steps, loss, mult, ms / 1e3, (total_batch / (ms / 1e3)),
+               avg * (max_steps - step - 1) / 3600.0);
         fflush(stdout);
+        if (!std::isfinite(loss)) {
+            fprintf(stderr, "loss is not finite at step %d; stopping (last checkpoint kept)\n", step + 1);
+            return 2;
+        }
 
-        if (val_every > 0 && ((step + 1) % val_every == 0 || step + 1 == max_steps)) {
+        if (g_rank == 0 && val_every > 0 && ((step + 1) % val_every == 0 || step + 1 == max_steps)) {
             int nval = val_max;
             int avail = (int)(val_loader.num_tokens / (size_t)(B * T));
             if (avail > 0 && nval > avail) nval = avail;
@@ -1008,6 +1195,15 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
         if (ckpt_every > 0 && (step + 1) % ckpt_every == 0) save_ckpt(step + 1);
+        if (time_limit > 0 && step + 1 < max_steps) {
+            float over = (now_seconds() - t_start >= time_limit) ? 1.f : 0.f;
+            if (dist_reduce(over, 1) > 0.f) {
+                save_ckpt(step + 1);
+                printf("time limit %.0fs reached after step %d; rerun with -y 1 to continue\n", time_limit, step + 1);
+                fflush(stdout);
+                return 0;
+            }
+        }
     }
     save_ckpt(max_steps);
     printf("done\n");
