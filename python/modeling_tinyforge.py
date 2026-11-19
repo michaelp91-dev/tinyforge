@@ -201,6 +201,8 @@ try:
                 qk_scale=config.qk_scale,
                 rope_base=config.rope_base,
             )
+            # Sets the bookkeeping newer transformers expects (e.g. all_tied_weights_keys).
+            self.post_init()
 
         def forward(self, input_ids=None, labels=None, attention_mask=None, **kwargs):
             # logits are already cropped to vocab_size and softcapped, which is
