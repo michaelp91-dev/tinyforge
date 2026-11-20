@@ -1,0 +1,12 @@
+{
+ "id": "008-best-rerun",
+ "description": "rerun of best (005 batch32k) as session anchor and noise check",
+ "code_ref": "bdc405d8f39afd311beb3b5764d5392d0e2a9475",
+ "base": "005-batch32k",
+ "args": {
+  "-e": "d12",
+  "-b": 16,
+  "-t": 512,
+  "-d": 32768
+ }
+}

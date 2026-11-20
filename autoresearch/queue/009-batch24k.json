@@ -1,0 +1,12 @@
+{
+ "id": "009-batch24k",
+ "description": "total batch 24,576 tokens per step (between 16k and 32k)",
+ "code_ref": "bdc405d8f39afd311beb3b5764d5392d0e2a9475",
+ "base": "005-batch32k",
+ "args": {
+  "-e": "d12",
+  "-b": 16,
+  "-t": 512,
+  "-d": 24576
+ }
+}
