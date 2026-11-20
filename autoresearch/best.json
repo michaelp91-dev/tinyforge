@@ -1,0 +1,8 @@
+{
+ "id": "000-baseline",
+ "description": "baseline: the 8-hour notebook's d12 config (tag tinyforge-8hr-v1), run for the fixed 12-minute budget",
+ "code_ref": "736cad61f7e42772e24c3b4912b23591300dc89a",
+ "args": {"-e": "d12", "-b": 16, "-t": 512, "-d": 65536},
+ "val_bpb": null,
+ "memory_gb": null
+}

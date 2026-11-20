@@ -1,0 +1,12 @@
+{
+ "id": "000-baseline",
+ "description": "baseline: 8-hour config (d12, -b 16 -t 512 -d 65536, trainer defaults) for the fixed 12-minute budget",
+ "code_ref": "736cad61f7e42772e24c3b4912b23591300dc89a",
+ "base": "000-baseline",
+ "args": {
+  "-e": "d12",
+  "-b": 16,
+  "-t": 512,
+  "-d": 65536
+ }
+}

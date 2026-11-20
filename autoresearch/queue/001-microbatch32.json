@@ -1,0 +1,12 @@
+{
+ "id": "001-microbatch32",
+ "description": "micro batch 32 instead of 16 (same 65,536 tokens per step, 2 micro-steps instead of 4): throughput test",
+ "code_ref": "736cad61f7e42772e24c3b4912b23591300dc89a",
+ "base": "000-baseline",
+ "args": {
+  "-e": "d12",
+  "-b": 32,
+  "-t": 512,
+  "-d": 65536
+ }
+}

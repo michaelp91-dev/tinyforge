@@ -1,0 +1,12 @@
+{
+ "id": "002-batch32k",
+ "description": "total batch 32,768 tokens per step instead of 65,536: twice the optimizer steps in 12 minutes",
+ "code_ref": "736cad61f7e42772e24c3b4912b23591300dc89a",
+ "base": "000-baseline",
+ "args": {
+  "-e": "d12",
+  "-b": 16,
+  "-t": 512,
+  "-d": 32768
+ }
+}
