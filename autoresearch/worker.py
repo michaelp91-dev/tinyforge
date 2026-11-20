@@ -273,6 +273,7 @@ class Worker:
             rec["error"] = f"build failed: {str(ex)[:300]}"
             open(logp, "w").write(rec["error"] + "\n")
             return rec, logp
+        os.makedirs(os.path.join(self.work, "scratch"), exist_ok=True)
         cmd = [binary, "-i", self.c["train_glob"], "-j", self.c["val_bin"], "-o", os.path.join(self.work, "scratch", rid),
                "-x", "1000000", "-v", "0", "-m", str(self.c["eval_tokens"] // (e["B"] * e["T"])), "-n", "0", "-y", "0",
                "--time-budget", str(self.c["time_budget_s"]), "--vocab", str(self.c["vocab"]),
