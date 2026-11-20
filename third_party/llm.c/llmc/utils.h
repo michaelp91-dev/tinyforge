@@ -181,7 +181,13 @@ extern inline void create_dir_if_not_exists(const char *dir) {
     if (dir == NULL) { return; }
     struct stat st = {0};
     if (stat(dir, &st) == -1) {
-        if (mkdir(dir, 0700) == -1) {
+        // create missing parent directories first (mkdir -p)
+        char tmp[1024];
+        snprintf(tmp, sizeof(tmp), "%s", dir);
+        for (char *p = tmp + 1; *p; p++) {
+            if (*p == '/') { *p = 0; mkdir(tmp, 0700); *p = '/'; }
+        }
+        if (mkdir(dir, 0700) == -1 && stat(dir, &st) == -1) {
             printf("ERROR: could not create directory: %s\n", dir);
             exit(EXIT_FAILURE);
         }
