@@ -141,7 +141,44 @@ def test_tokenizer_bytes():
     print("tokenizer smoke ok")
 
 
+def test_gguf_convert():
+    try:
+        import gguf
+    except ImportError:
+        print("gguf not installed; skipping GGUF convert test")
+        return
+    import subprocess
+    from train_tokenizer import train
+    cfg = dict(max_seq=64, vocab=320, n_layer=2, n_head=1, n_embd=128, padded_vocab=384,
+               rope=True, rmsnorm=True, qknorm=True, relu2=True, untie=True, bias=False,
+               embed_norm=True, softcap=15.0, qk_scale=1.2, rope_base=100000.0)
+    rng = np.random.default_rng(0)
+    arrays = modern_arrays(cfg, lambda shape: rng.standard_normal(shape).astype(np.float32))
+    texts = ["hello world " * 20, "the cat sat on the mat " * 20, "12345 67890 " * 10] * 30
+    with tempfile.TemporaryDirectory() as d:
+        train(texts, vocab_size=300, out_dir=os.path.join(d, "tok"))
+        ckpt = os.path.join(d, "model.bin")
+        write_ckpt(ckpt, cfg, arrays)
+        out = os.path.join(d, "m.gguf")
+        subprocess.run([sys.executable, str(ROOT / "python" / "convert_tinyforge_to_gguf.py"),
+                        "--checkpoint", ckpt, "--tokenizer", os.path.join(d, "tok"), "--out", out], check=True)
+        r = gguf.GGUFReader(out)
+        arch = bytes(r.fields["general.architecture"].parts[-1]).decode()
+        if arch != "nanochat":
+            raise AssertionError(f"arch {arch}")
+        t = {x.name: x for x in r.tensors}
+        q = np.asarray(t["blk.0.attn_q.weight"].data).reshape(128, 128)
+        if not np.allclose(q, arrays[2][:128]):
+            raise AssertionError("attn_q is not the first third of qkv")
+        if not np.allclose(np.asarray(t["blk.1.attn_k_norm.weight"].data), 1.2):
+            raise AssertionError("k norm weight should carry qk_scale")
+        if len(r.fields["tokenizer.ggml.tokens"].data) != 384:
+            raise AssertionError("token list must cover every embedding row")
+    print("gguf convert ok")
+
+
 if __name__ == "__main__":
     test_modern_roundtrip()
     test_gpt2_export_keys()
     test_tokenizer_bytes()
+    test_gguf_convert()

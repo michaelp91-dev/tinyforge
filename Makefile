@@ -7,6 +7,32 @@ NVCC_ARCH ?= -gencode arch=compute_80,code=compute_80 -gencode arch=compute_80,c
 NVCC_FLAGS ?= -std=c++17 -O3 --use_fast_math $(NVCC_ARCH) -Ithird_party/llm.c -Isrc
 NVCC_LIBS ?= -lcublas -lcublasLt -lnvToolsExt
 
+# make GPU=t4: Turing (Colab/Kaggle T4) has no bf16 and no TF32. The default
+# is fp16 activations/weights on the tensor cores with fp32 master weights,
+# fp32 optimizer state and dynamic loss scaling. T4_PREC=fp32 builds the old
+# all-fp32 trainer (no tensor cores, ~3x slower).
+T4_PREC ?= fp16
+ifeq ($(GPU),t4)
+ifeq ($(T4_PREC),fp32)
+NVCC_ARCH := -gencode arch=compute_75,code=sm_75 -DENABLE_FP32
+else
+NVCC_ARCH := -gencode arch=compute_75,code=sm_75 -DENABLE_FP16 -DTF_FP16_GEMMEX
+endif
+NVCC_LIBS := -lcublas -lcublasLt
+endif
+
+# make USE_NCCL=1 [NCCL_HOME=/path]: multi-GPU data parallel (--nproc/--rank).
+# NCCL_HOME can be the pip wheel dir (python -c "import nvidia.nccl, os; print(os.path.dirname(nvidia.nccl.__file__))").
+ifeq ($(USE_NCCL),1)
+ifneq ($(NCCL_HOME),)
+NVCC_DEFS += -DTF_NCCL -I$(NCCL_HOME)/include
+NVCC_LIBS += -L$(NCCL_HOME)/lib -Xlinker -rpath=$(NCCL_HOME)/lib -l:libnccl.so.2
+else
+NVCC_DEFS += -DTF_NCCL
+NVCC_LIBS += -lnccl
+endif
+endif
+
 .PHONY: all test cpu cuda stock clean
 
 all: test cuda
@@ -25,7 +51,7 @@ third_party/llm.c/train_gpt2: third_party/llm.c/train_gpt2.c
 cuda: train_tinyforge
 
 train_tinyforge: src/train_tinyforge.cu src/tf_kernels.cuh
-	$(NVCC) $(NVCC_FLAGS) -o $@ src/train_tinyforge.cu $(NVCC_LIBS)
+	$(NVCC) $(NVCC_FLAGS) $(NVCC_DEFS) -o $@ src/train_tinyforge.cu $(NVCC_LIBS)
 
 stock: third_party/llm.c/train_gpt2cu
 

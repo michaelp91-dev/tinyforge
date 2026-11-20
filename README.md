@@ -23,10 +23,14 @@ Default `train_tinyforge` (`--arch modern`) is not GPT-2. Each piece can be turn
 
 Shapes follow nanochat's depth rule, not llm.c's GPT-2 table. `dN` means depth `N`, width `align(N * 64, 128)`, head dim 128.
 
-| name | layers | width | heads |
-| --- | --- | --- | --- |
-| d6 | 6 | 384 | 3 |
-| d12 | 12 | 768 | 6 |
+| name | layers | width | heads | params | matrix params |
+| --- | --- | --- | --- | --- | --- |
+| d6 | 6 | 384 | 3 | 35.8M | 10.6M |
+| d12 | 12 | 768 | 6 | 135.3M | 84.9M |
+| d16 | 16 | 1024 | 8 | 268.4M | 201.3M |
+| d20 | 20 | 1280 | 10 | 477.1M | 393.2M |
+
+Params are `12·C²·L` for the blocks plus `2·32768·C` for the untied input and output embeddings.
 
 `--arch gpt2` switches to the llm.c GPT-2 table (d6 = 384/6 heads, d12 = 768/12 heads), learned positions, affine LayerNorm, tanh-GELU, biases, tied embeddings, and one AdamW. That mode is the same **architecture** as llm.c. The bit-level baseline is still the vendored binary, which is the code that produced the numbers below.
 
@@ -108,6 +112,26 @@ make -C third_party/llm.c train_gpt2cu
 
 Prepare that data with `python python/prepare_climbmix.py --tokenizer gpt2`.
 
+## T4 and Kaggle (fp32, multi-GPU, resume)
+
+A T4 (sm_75) has no bf16, so build it in fp32:
+
+```bash
+make train_tinyforge GPU=t4                       # one GPU
+make train_tinyforge GPU=t4 USE_NCCL=1 NCCL_HOME=/path/to/nvidia/nccl   # data parallel
+```
+
+d12 on a 16 GB T4 uses `-b 16 -t 512` (about 9 GiB). `-b 16 -t 1024` needs about 17 GiB and does not fit. Keep the same `-d 262144` total batch; accumulation fills the rest.
+
+Flags added for long runs on session-limited machines:
+
+- `--time-limit <seconds>`: write a checkpoint and exit cleanly before the session ends. Rerun with `-y 1` to continue.
+- `--keep-ckpts N`: keep only the newest N checkpoints (a d12 checkpoint is about 1.8 GB including optimizer state).
+- `--nproc N --rank R --sync-dir DIR`: one process per GPU, gradients averaged with NCCL. Start one process per rank with the same arguments. `-d` is the global batch. Checkpoints written by one GPU count resume on two GPUs and back.
+- Checkpoints are written under a temp name and renamed, so a killed session never leaves a half-written file.
+
+`TinyForge.ipynb` (Colab) is a short T4 smoke test: about 60 small steps, a time-limited stop, and a resume. `TinyForge-Kaggle.ipynb` is the full d12 run on Kaggle's 2×T4 with resume across sessions.
+
 ## Evaluate
 
 ```bash
@@ -119,6 +143,19 @@ MODEL_DIR=d6-hf python python/eval_bpb.py
 `export_hf.py` writes `d6-hf/` (or `d12-hf/`) with `config.json`, `pytorch_model.bin`, and `modeling_tinyforge.py`. Classic GPT-2 flags are exported as `GPT2LMHeadModel` instead, which the original tiktoken eval can score. `eval_bpb.py` handles both: tiktoken GPT-2, or the saved tokenizer when `model_type` is `tinyforge`. Document separators count as 0 bytes. The val shard is `shard_06542` of `karpathy/climbmix-400b-shuffle`.
 
 The trainer's own val loss is on `val.bin` from the prepare script. That is a monitor, not the published bpb.
+
+## GGUF (llama.cpp)
+
+Stock llama.cpp has no architecture for this block. nanochat uses the same block, and the `nanochat` branch of [ulanch/llama.cpp](https://github.com/ulanch/llama.cpp) adds it as arch `nanochat`. `python/convert_tinyforge_to_gguf.py` writes that arch. The QK-norm scale goes into the q/k norm weights, and the parameter-free norms are written as ones.
+
+```bash
+python python/convert_tinyforge_to_gguf.py --model d12-hf --out d12-f32.gguf
+llama-quantize d12-f32.gguf d12-q8_0.gguf Q8_0
+llama-server -m d12-q8_0.gguf --port 8099 &
+python python/check_gguf.py --model d12-hf --url http://127.0.0.1:8099
+```
+
+`check_gguf.py` compares tokenization and next-token probabilities against the PyTorch module. Quantize from f32 or bf16, not f16, because ReLU² activations can overflow fp16.
 
 ## Tests
 

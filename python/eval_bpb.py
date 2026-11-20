@@ -59,10 +59,10 @@ def load_tinyforge(model_dir):
     if os.path.exists(npy):
         counts = np.load(npy)
     else:
-        from train_tokenizer import BOS, token_nbytes
+        from train_tokenizer import SPECIALS, token_nbytes
         raw = tok.backend_tokenizer
         counts = np.array([
-            0 if raw.id_to_token(i) == BOS else token_nbytes(raw.id_to_token(i), {BOS})
+            token_nbytes(raw.id_to_token(i), set(SPECIALS))
             for i in range(tok.vocab_size)
         ], dtype=np.int64)
     token_bytes = torch.tensor(counts, dtype=torch.int64)
