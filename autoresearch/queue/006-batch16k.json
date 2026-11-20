@@ -1,7 +1,7 @@
 {
  "id": "006-batch16k",
  "description": "total batch 16,384 tokens per step: four times the optimizer steps (rerun after output-dir fix)",
- "code_ref": "0a68985eab52a5d7ddf281f1da54a504ffa8f9ca",
+ "code_ref": "bdc405d8f39afd311beb3b5764d5392d0e2a9475",
  "base": "000-baseline",
  "args": {
   "-e": "d12",
