@@ -14,6 +14,7 @@ Get the lowest **val_bpb** after **12 minutes of training on one Colab T4**, sta
 - **Budget:** 12 minutes of training time (`--time-budget 720`). The first 3 steps (warm-up) and the final eval don't count. The LR schedule runs on time progress, so every experiment gets a full warmdown.
 - **Worker-owned flags (rejected if present):** `-i -j -o -x -v -m -n -y --time-limit --time-budget --token-bytes --vocab --keep-ckpts --nproc --rank --sync-dir --profile`.
 - **The HF repos, the notebook's caps, and the 8-hour notebook.** Changes to the notebook itself need Michael.
+- **Session caps (trial defaults Michael chose):** 8 experiments, 2.2 h session cap (no experiment starts unless it can finish before it), 20 min idle timeout, hard watchdog at 2.45 h. That is about 2 compute units. Raising them needs Michael.
 - **Comparisons:** these bpb numbers are not comparable with the 8-hour run's 1.0861. That run trained 40x longer and evaluated on a slightly different token count.
 
 ## What you may change

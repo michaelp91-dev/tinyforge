@@ -56,6 +56,8 @@ env = {"TF_LOCAL_TEST": "1", "TF_REPO_URL": bare, "TF_HF_MOCK_DIR": mock, "TF_CO
        "TF_FAKE_TRAINER": os.path.join(ROOT, "tests", "autoresearch", "fake_trainer_ar.py"),
        "TF_TIME_BUDGET_MIN": "0.05", "TF_IDLE_TIMEOUT_MIN": "0.25", "TF_POLL_S": "1", "TF_EXP_OVERHEAD_S": "8",
        "TF_MAX_EXPERIMENTS": "12", "TF_MAX_SESSION_H": "1.0", "TF_TEST_TOKEN": "hf_SECRET_test_value", "FAKE_STEP_S": "0.05"}
+if SC == "max_exp":
+    env["TF_MAX_EXPERIMENTS"] = "1"
 if SC == "hang":
     env["FAKE_HANG"] = "1"
 if SC == "session_cap":
@@ -140,6 +142,8 @@ if SC == "session_cap":
     assert status["stop_reason"].startswith("session time cap"), status["stop_reason"]
 elif SC == "idle_empty":
     assert not rows and status["stop_reason"].startswith("idle timeout")
+elif SC == "max_exp":
+    assert len(rows) == 1 and status["stop_reason"].startswith("max experiments (1)"), (rows, status["stop_reason"])
 elif SC == "hang":
     assert st["000-baseline"] == "crash" and "timeout" in tsv, tsv
 elif SC == "relaunch":

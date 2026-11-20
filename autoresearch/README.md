@@ -2,7 +2,7 @@
 
 Fixed-budget hyperparameter and model research for TinyForge on one Colab T4. Adapted from [karpathy/autoresearch](https://github.com/karpathy/autoresearch) (MIT License, Copyright (c) Andrej Karpathy): the fixed time budget, val bpb as the only metric, the `results.tsv` format, keep/discard, and the `program.md` researcher guide all come from there. In this version the researcher is Jarvis (asynchronous, through git) and the Colab notebook is a dumb worker.
 
-- `../TinyForge-AutoResearch.ipynb`: the Colab worker. Run all on a T4; it disconnects itself.
+- `../TinyForge-AutoResearch.ipynb`: the Colab worker. Run all on a T4; it disconnects itself. Trial defaults: 8 experiments, 2.2 h session cap, 20 min idle timeout, watchdog at 2.45 h (about 2 compute units).
 - `worker.py`: poll queue, build per commit (cached), train with `--time-budget`, score, upload.
 - `program.md`: rules and procedure for the researcher.
 - `ar.py`: researcher helper (`new`, `promote`, `show`, `check`).

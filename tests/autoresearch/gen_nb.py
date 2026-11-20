@@ -16,7 +16,7 @@ Short fixed-time training experiments on the d12 TinyForge model, scored only by
 3. It trains for a fixed **12 minutes** of training time and runs the same fixed eval: 229,376 val tokens at sequence length 512.
 4. It appends one row to `results.tsv` and uploads the log to the **private** HF repo `<you>/tinyforge-autoresearch`. Jarvis reads that repo, decides what to keep, and pushes the next experiments.
 
-**Safety caps:** at most `MAX_EXPERIMENTS` per session and `MAX_SESSION_H` hours. If the queue stays empty for `IDLE_TIMEOUT_MIN` minutes, it saves and disconnects. `control.json` with `stop: true` ends the session after the current experiment. Crashes and OOMs are logged as `crash` and the worker moves on. Two watchdogs disconnect at `MAX_SESSION_H + 0.5` hours no matter what, and the disconnect sits in a `finally`. Nothing touches Google Drive.
+**Safety caps:** at most `MAX_EXPERIMENTS` per session and `MAX_SESSION_H` hours. If the queue stays empty for `IDLE_TIMEOUT_MIN` minutes, it saves and disconnects. `control.json` with `stop: true` ends the session after the current experiment. Crashes and OOMs are logged as `crash` and the worker moves on. Trial defaults: 8 experiments, 2.2 h session cap. Two watchdogs disconnect at `MAX_SESSION_H + 0.25` hours (2.45 h; the process watchdog 10 min later) no matter what, and the disconnect sits in a `finally`. Nothing touches Google Drive.
 
 **Before the first run:** the Colab secret **`HF_TOKEN`** (a Hugging Face token with write access, Notebook access on) is the same one the 8-hour notebook uses. The token is never printed.
 
@@ -33,8 +33,8 @@ def _knob(name, default):
     return type(default)(v) if v is not None else default
 
 # Knobs (Michael: these are the caps that control compute-unit spend)
-MAX_EXPERIMENTS  = _knob("MAX_EXPERIMENTS", 20)     # per session
-MAX_SESSION_H    = _knob("MAX_SESSION_H", 5.0)      # stop starting experiments after this; watchdog at +0.5 h
+MAX_EXPERIMENTS  = _knob("MAX_EXPERIMENTS", 8)      # per session (trial: 8 x ~13.5 min, about 2 compute units)
+MAX_SESSION_H    = _knob("MAX_SESSION_H", 2.2)      # 8 x 13.5 min + ~6 min setup + slack; no experiment starts that could pass it
 IDLE_TIMEOUT_MIN = _knob("IDLE_TIMEOUT_MIN", 20.0)  # empty queue this long -> save and disconnect
 TIME_BUDGET_MIN  = _knob("TIME_BUDGET_MIN", 12.0)   # training time per experiment (fixed; changing it resets comparability)
 EXP_OVERHEAD_S   = _knob("EXP_OVERHEAD_S", 300)     # startup + final eval allowance; hard kill at budget + this
@@ -54,7 +54,7 @@ TZ_NAME       = "America/Chicago"
 
 CONTENT = os.environ.get("TF_CONTENT", "/content")
 T0 = time.time()
-WATCHDOG_H = MAX_SESSION_H + 0.5
+WATCHDOG_H = MAX_SESSION_H + 0.25   # hard stop just above the session cap
 STATUS = {}
 HF_ENV = None
 HF_TOKEN_STR = None
