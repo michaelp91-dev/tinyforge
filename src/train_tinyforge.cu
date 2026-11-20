@@ -1135,6 +1135,9 @@ static void usage(void) {
         "  --warmup 40 --warmdown 0.65 --final-lr-frac 0.05 -k warmdown|cosine|linear|constant\n"
         "  --momentum 0.95 --token-bytes <int32 file>\n"
         "  --time-limit <seconds: checkpoint and exit>  --keep-ckpts <N newest kept>\n"
+        "  --time-budget <seconds>: autoresearch mode. LR schedule follows training time / budget\n"
+        "      (warmup still in steps), stops when the budget is used, runs one final val on -m batches,\n"
+        "      prints a '---' summary (val_bpb, peak_vram_mb, ...) and exits without a checkpoint\n"
         "  --nproc N --rank R --sync-dir <dir>   (one process per GPU, NCCL build)\n"
         "Stock GPT-2 baseline (bit-level llm.c): make -C third_party/llm.c train_gpt2cu\n");
     exit(1);
@@ -1173,6 +1176,7 @@ int main(int argc, char** argv) {
     int warmup = modern ? 40 : 0;
     int vocab_set = 0, sched_set = 0;
     double time_limit = 0;
+    double time_budget = 0;   // autoresearch: fixed training-time budget in seconds (0 = off)
     int prof_steps = 0;
 #ifdef ENABLE_FP16
     float loss_scale = 65536.f; // dynamic; halves on overflow, doubles after 200 clean steps
@@ -1227,6 +1231,7 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--momentum") == 0) momentum = arg_float(v);
         else if (strcmp(a, "--token-bytes") == 0) token_bytes_path = v;
         else if (strcmp(a, "--time-limit") == 0) time_limit = atof(v);
+        else if (strcmp(a, "--time-budget") == 0) time_budget = atof(v);
         else if (strcmp(a, "--loss-scale") == 0) loss_scale = arg_float(v);
         else if (strcmp(a, "--profile") == 0) prof_steps = arg_int(v);
         else if (strcmp(a, "--ns-fp16") == 0) g_ns_fast16 = arg_int(v);
@@ -1270,6 +1275,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (g_world < 1 || g_rank < 0 || g_rank >= g_world) { fprintf(stderr, "bad --nproc/--rank\n"); return 1; }
+    if (time_budget > 0 && g_world > 1) { fprintf(stderr, "--time-budget is single-GPU only\n"); return 1; }
     if (g_world > 1 && !sync_dir) sync_dir = out_dir ? out_dir : ".";
     if (total_batch < 0) total_batch = B * T * g_world;
     if (total_batch % (B * T * g_world) != 0) {
@@ -1486,6 +1492,19 @@ int main(int argc, char** argv) {
     double t_start = now_seconds();
     double step_time_sum = 0;
     int step_time_n = 0;
+    // Autoresearch time budget (idea from karpathy/autoresearch, MIT): only training time
+    // counts, and the first AR_SKIP steps (cuBLAS/kernel warm-up) are not counted.
+    const int AR_SKIP = 3;
+    double ar_train_time = 0, ar_t_prev = now_seconds(), ar_peak_gib = 0;
+    long long ar_tokens = 0;
+    int ar_stop = 0;
+    if (time_budget > 0) {
+        size_t np = 0;
+        for (int i = 0; i < model->ntensors; i++) np += model->tensors[i].n;
+        printf("autoresearch: time budget %.0fs of training, final val on %d batches of %d tokens, params %.2fM\n",
+               time_budget, val_max, B * T, np / 1e6);
+        fflush(stdout);
+    }
 
     for (int step = start_step; step < max_steps; step++) {
         cudaEvent_t ev0, ev1;
@@ -1516,7 +1535,17 @@ int main(int argc, char** argv) {
         fold_embed_grads(model);
         dist_average_grads(model);
         prof_mark("fold+allreduce");
-        float mult = lr_multiplier(step, max_steps, warmup, warmdown, final_frac, sched);
+        float mult;
+        if (time_budget > 0) {
+            double progress = ar_train_time / time_budget;
+            if (progress > 1.0) progress = 1.0;
+            const int VT = 1000000;   // virtual steps: the schedule runs on training-time progress
+            mult = lr_multiplier((int)(progress * VT), VT, 0, warmdown, final_frac, sched);
+            int done_steps = step - start_step;
+            if (warmup > 0 && done_steps < warmup) mult *= (float)(done_steps + 1) / (float)warmup;
+        } else {
+            mult = lr_multiplier(step, max_steps, warmup, warmdown, final_frac, sched);
+        }
         int overflow = 0;
         if (loss_scale != 1.f) {
             ck(cudaMemsetAsync(d_nonfinite, 0, sizeof(int)), "flag");
@@ -1572,8 +1601,19 @@ int main(int argc, char** argv) {
             fprintf(stderr, "loss is not finite at step %d; stopping (last checkpoint kept)\n", step + 1);
             return 2;
         }
+        if (time_budget > 0) {
+            double now = now_seconds();
+            if (step - start_step >= AR_SKIP) { ar_train_time += now - ar_t_prev; ar_tokens += total_batch; }
+            ar_t_prev = now;
+            if (step - start_step == AR_SKIP || step + 1 == max_steps) {
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
+                    ar_peak_gib = std::max(ar_peak_gib, (total_b - free_b) / 1073741824.0);
+            }
+            if (ar_train_time >= time_budget || step + 1 == max_steps) ar_stop = 1;
+        }
 
-        if (g_rank == 0 && val_every > 0 && ((step + 1) % val_every == 0 || step + 1 == max_steps)) {
+        if (g_rank == 0 && ((val_every > 0 && ((step + 1) % val_every == 0 || step + 1 == max_steps)) || ar_stop)) {
             int nval = val_max;
             int avail = (int)(val_loader.num_tokens / (size_t)(B * T));
             if (avail > 0 && nval > avail) nval = avail;
@@ -1604,6 +1644,26 @@ int main(int argc, char** argv) {
             if (token_bytes && nbytes > 0) printf("  bpb %.4f  (%.3f bytes/token)", nats / (log(2.0) * nbytes), nbytes / ((double)nval * B * T));
             printf("\n");
             fflush(stdout);
+            if (ar_stop) {
+                size_t np = 0;
+                for (int i = 0; i < model->ntensors; i++) np += model->tensors[i].n;
+                double bpb = (token_bytes && nbytes > 0) ? nats / (log(2.0) * nbytes) : 0.0;
+                printf("---\n");
+                printf("val_bpb:          %.6f\n", bpb);
+                printf("val_loss:         %.6f\n", vloss);
+                printf("val_tokens:       %lld\n", (long long)nval * B * T);
+                printf("training_seconds: %.1f\n", ar_train_time);
+                printf("total_seconds:    %.1f\n", now_seconds() - t_start);
+                printf("peak_vram_mb:     %.1f\n", ar_peak_gib * 1024.0);
+                printf("total_tokens_M:   %.2f\n", (double)(step + 1 - start_step) * total_batch / 1e6);
+                printf("tok_per_sec:      %.0f\n", ar_train_time > 0 ? ar_tokens / ar_train_time : 0.0);
+                printf("num_steps:        %d\n", step + 1);
+                printf("num_params_M:     %.2f\n", np / 1e6);
+                printf("depth:            %d\n", cfg.L);
+                printf("done\n");
+                fflush(stdout);
+                return 0;
+            }
         }
         if (ckpt_every > 0 && (step + 1) % ckpt_every == 0) save_ckpt(step + 1);
         if (time_limit > 0 && step + 1 < max_steps) {
